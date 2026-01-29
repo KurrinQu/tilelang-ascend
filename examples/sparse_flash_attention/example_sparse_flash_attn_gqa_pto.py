@@ -7,7 +7,7 @@ torch.manual_seed(42)
 
 tilelang.disable_cache()
 
-@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6, 7], target="pto", platform="A5")
+@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6, 7], target="ptoas", platform="A5")
 def sparse_attention_fwd(
     heads,
     dim,
