@@ -16,13 +16,13 @@ while [[ $# -gt 0 ]]; do
             USE_SHMEM=true
             shift
             ;;
-        --llvm-config)
-            LLVM_CONFIG_PATH="$2"
+        --ptoas-root)
+            PTOAS_ROOT="$2"
             shift 2
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--enable-llvm] [--enable-shmem]"
+            echo "Usage: $0 [--enable-llvm] [--enable-shmem] [--ptoas-root <path>]"
             exit 1
             ;;
     esac
@@ -41,6 +41,7 @@ fi
 echo "Starting installation script..."
 echo "LLVM enabled: $USE_LLVM"
 echo "SHMEM enabled: $USE_SHMEM"
+echo "PTOAS root path: ${PTOAS_ROOT:-'not specified'}"
 
 # Step 1: Install Python requirements
 echo "Installing Python requirements from requirements.txt..."
@@ -119,11 +120,6 @@ if $USE_LLVM; then
     echo "LLVM config path determined as: $LLVM_CONFIG_PATH"
 fi
 
-if $LLVM_CONFIG_PATH; then
-    CMAKE_OPTIONS+=" -DUSE_LLVM=${LLVM_CONFIG_PATH} "
-    echo "CMake options updated with LLVM config path: $CMAKE_OPTIONS"
-fi
-
 # Step 9: Clone and build TVM
 echo "Cloning TVM repository and initializing submodules..."
 # clone and build tvm
@@ -138,9 +134,18 @@ cp 3rdparty/tvm/cmake/config.cmake build
 cd build
 
 echo "set(USE_ASCEND ON)" >> config.cmake
+echo "set(USE_PTOAS ON)" >> config.cmake
+
+if [[ -n "$PTOAS_ROOT" ]]; then
+    MLIR_DIR=${PTOAS_ROOT}/lib/cmake/mlir
+    LLVM_DIR=${PTOAS_ROOT}/lib/cmake/llvm
+    echo "set(MLIR_DIR ${MLIR_DIR})" >> config.cmake
+    echo "set(LLVM_DIR ${LLVM_DIR})" >> config.cmake
+    echo "Using PTOAS root at: $PTOAS_ROOT"
+fi
 
 echo "Running CMake for TileLang..."
-cmake .. -DUSE_PTOAS=ON $CMAKE_OPTIONS
+cmake ..
 if [ $? -ne 0 ]; then
     echo "Error: CMake configuration failed."
     exit 1

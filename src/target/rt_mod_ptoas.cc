@@ -8,20 +8,10 @@ namespace codegen {
 
 runtime::Module BuildTileLangPTOAS(IRModule mod, Target target, std::string platform) {
   using tvm::runtime::Registry;
-  bool output_ssa = false;
   CodeGenTileLangPTOAS cg(platform);
-  cg.Init(output_ssa);
+  cg.Init();
 
   Array<String> function_names;
-
-  for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>())
-        << "CodeGenTileLangPTOAS: Can only take PrimFunc";
-    auto gvar = Downcast<GlobalVar>(kv.first);
-    auto f = Downcast<PrimFunc>(kv.second);
-    cg.AddFunction(gvar, f);
-    function_names.push_back(cg.GetFunctionName(gvar));
-  }
 
   std::string code = cg.Finish();
 

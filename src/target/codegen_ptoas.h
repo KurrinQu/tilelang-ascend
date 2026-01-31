@@ -8,6 +8,13 @@
 #ifndef TVM_TL_TARGET_CODEGEN_PTOAS_H_
 #define TVM_TL_TARGET_CODEGEN_PTOAS_H_
 
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/MLIRContext.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/PTO/IR/PTO.h>
+
 #include <tvm/target/codegen.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
@@ -20,8 +27,21 @@
 namespace tvm {
 namespace codegen {
 
-class CodeGenTileLangPTOAS final : public CodeGenC {
+class CodeGenPTOAS : public CodeGenC {
 public:
+  CodeGenPTOAS();
+  virtual ~CodeGenPTOAS();
+  virtual void Init();
+  virtual std::string Finish();
+
+  std::unique_ptr<mlir::MLIRContext> context_;
+  std::unique_ptr<mlir::OpBuilder> builder_;
+  mlir::OwningOpRef<mlir::ModuleOp> module_;
+};
+
+class CodeGenTileLangPTOAS final : public CodeGenPTOAS {
+public:
+  using super = CodeGenPTOAS;
   CodeGenTileLangPTOAS(std::string platform);
   std::string Finish();
   // override behavior

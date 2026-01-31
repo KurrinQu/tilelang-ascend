@@ -164,6 +164,8 @@ set(TILE_LANG_INCLUDES
   ${TVM_SOURCE_DIR}/3rdparty/dmlc-core/include
 )
 
+set(TILE_LANG_LINKER_LIBS "")
+
 # Find CUDA Toolkit
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -179,6 +181,39 @@ if(USE_CUDA)
   
   list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
 endif(USE_CUDA)
+
+if(USE_PTOAS)
+  find_package(MLIR REQUIRED CONFIG)
+
+  if(NOT MLIR_FOUND)
+    message(FATAL_ERROR "MLIR not found. Please set MLIR_DIR.")
+  endif()
+
+  message(STATUS "MLIR includes: ${MLIR_INCLUDE_DIRS}")
+  list(APPEND TILE_LANG_INCLUDES ${MLIR_INCLUDE_DIRS})
+  list(APPEND TILE_LANG_LINKER_LIBS
+    MLIRIR
+    MLIRSupport
+    MLIRFuncDialect
+    MLIRArithDialect
+    MLIRPTODialect
+    MLIRDestinationStyleOpInterface
+    MLIRAsmParser
+  )
+
+  find_package(LLVM REQUIRED CONFIG)
+
+  if(NOT LLVM_FOUND)
+    message(FATAL_ERROR "LLVM not found. Please set LLVM_DIR.")
+  endif()
+
+  message(STATUS "LLVM includes: ${LLVM_INCLUDE_DIRS}")
+  list(APPEND TILE_LANG_INCLUDES ${LLVM_INCLUDE_DIRS})
+  list(APPEND TILE_LANG_LINKER_LIBS
+    LLVMCore
+    LLVMSupport
+  )
+endif()
 
 # Find ROCM Toolkit
 if(USE_ROCM)
@@ -229,6 +264,7 @@ endif()
 # Module shared library
 add_library(tilelang_module SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang_module PUBLIC tvm)
+target_link_libraries(tilelang_module PUBLIC ${TILE_LANG_LINKER_LIBS})
 
 # Install targets
 if(TILE_LANG_INSTALL_STATIC_LIB)

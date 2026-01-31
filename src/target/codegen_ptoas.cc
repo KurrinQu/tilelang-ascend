@@ -11,6 +11,14 @@
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
 
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/MLIRContext.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/PTO/IR/PTO.h>
+#include <llvm/Support/raw_ostream.h>
+
 #include <cmath>
 #include <string>
 #include <utility>
@@ -27,6 +35,31 @@
   ([](const std::string& s){ std::stringstream ss; \
   ss << std::showbase << std::hex << std::uppercase << std::stoi(s); \
   return ss.str(); }(dec_str))
+
+namespace tvm {
+namespace codegen {
+CodeGenPTOAS::CodeGenPTOAS() = default;
+CodeGenPTOAS::~CodeGenPTOAS() = default;
+void CodeGenPTOAS::Init() {
+  context_ = std::make_unique<mlir::MLIRContext>();
+  context_->loadDialect<mlir::func::FuncDialect,
+                        mlir::arith::ArithDialect,
+                        mlir::pto::PTODialect>();
+  builder_ = std::make_unique<mlir::OpBuilder>(context_.get());
+  module_ = mlir::ModuleOp::create(mlir::UnknownLoc::get(context_.get()));
+}
+
+std::string CodeGenPTOAS::Finish() {
+  std::string code;
+  llvm::raw_string_ostream os(code);
+  if (module_) {
+    module_->print(os);
+  }
+  return code;
+}
+
+} // namespace codegen
+} // namespace tvm
 
 namespace tvm {
 namespace codegen {
@@ -112,16 +145,7 @@ void CodeGenTileLangPTOAS::PrintFuncPrefix(std::ostream &os) {
 }
 
 std::string CodeGenTileLangPTOAS::Finish() {
-  decl_stream << "#include \"tl_templates/pto/common.h\"\n";
-  decl_stream << "#include <pto/pto-inst.hpp>\n";
-  decl_stream << "#include \"acl/acl.h\"\n";
-  decl_stream << "#include <runtime/rt_ffts.h>\n";
-  decl_stream << "using namespace pto;\n";
-  decl_stream << "\n";
-  std::ostringstream code;
-  code << decl_stream.str();
-  code << stream.str();
-  return code.str();
+  return super::Finish();
 }
 
 void CodeGenTileLangPTOAS::VisitStmt_(const tir::ForNode *op) {
