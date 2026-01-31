@@ -115,6 +115,22 @@ class LibraryGenerator(object):
                 src.name,
             ]
         elif self.target == "ptoas":
+            src0 = tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False)
+            dst0 = tempfile.NamedTemporaryFile(mode="w+", suffix=".cpp", delete=False)
+            cmd0 = [
+                "ptoas",
+                f"{src0.name}"
+            ]
+            src0.write(self.lib_code)
+            src0.flush()
+            try:
+                ret0 = subprocess.run(cmd0, stdout=dst0, timeout=timeout)
+            except Exception as e:
+                raise RuntimeError(f"Compile kernel failed because of {e}") from e
+
+            dst0.seek(0)
+            self.lib_code = dst0.read()
+
             ccec = "dav-c310" if self.platform == 'A5' else "dav-c220"
             memory = "REGISTER_BASE" if self.platform == 'A5' else "MEMORY_BASE"
             command = [

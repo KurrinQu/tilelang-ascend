@@ -15,7 +15,7 @@ M = args.m
 N = args.n
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], target="ptoas", platform="A5")
 def vec_add(M, N, block_M, block_N, dtype="float"):
     m_num = M // block_M
     n_num = N // block_N
