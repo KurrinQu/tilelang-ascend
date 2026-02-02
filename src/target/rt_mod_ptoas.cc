@@ -11,11 +11,17 @@ runtime::Module BuildTileLangPTOAS(IRModule mod, Target target, std::string plat
   CodeGenTileLangPTOAS cg(platform);
   cg.Init();
 
-  Array<String> function_names;
+  for (auto kv : mod->functions) {
+    ICHECK(kv.second->IsInstance<PrimFuncNode>())
+        << "CodeGenTileLangAscendPto: Can only take PrimFunc";
+    auto gvar = Downcast<GlobalVar>(kv.first);
+    auto f = Downcast<PrimFunc>(kv.second);
+    cg.AddFunction(gvar, f);
+  }
 
   std::string code = cg.Finish();
 
-  return CSourceModuleCreate(code, "c", function_names);
+  return CSourceModuleCreate(code, "c", {});
 }
 
 TVM_REGISTER_GLOBAL("target.build.tilelang_ptoas")

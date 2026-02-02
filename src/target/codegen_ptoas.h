@@ -34,9 +34,15 @@ public:
   virtual void Init();
   virtual std::string Finish();
 
-  std::unique_ptr<mlir::MLIRContext> context_;
-  std::unique_ptr<mlir::OpBuilder> builder_;
-  mlir::OwningOpRef<mlir::ModuleOp> module_;
+  // Resolves MLIR type from TVM Type (which can be PointerType)
+  mlir::Type resolveType(const tvm::Type &type);
+  // Resolves MLIR type from primitive DataType
+  mlir::Type resolvePrimitiveType(const tvm::runtime::DataType &dtype);
+
+  mlir::MLIRContext context;
+  mlir::OpBuilder builder;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::unordered_map<const tvm::tir::VarNode*, mlir::Value> symbolTable;
 };
 
 class CodeGenTileLangPTOAS final : public CodeGenPTOAS {

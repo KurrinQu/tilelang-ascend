@@ -38,24 +38,53 @@
 
 namespace tvm {
 namespace codegen {
-CodeGenPTOAS::CodeGenPTOAS() = default;
+CodeGenPTOAS::CodeGenPTOAS() : builder(&context) {
+  context.loadDialect<mlir::func::FuncDialect,
+                      mlir::arith::ArithDialect,
+                      mlir::pto::PTODialect>();
+  module = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
+};
 CodeGenPTOAS::~CodeGenPTOAS() = default;
-void CodeGenPTOAS::Init() {
-  context_ = std::make_unique<mlir::MLIRContext>();
-  context_->loadDialect<mlir::func::FuncDialect,
-                        mlir::arith::ArithDialect,
-                        mlir::pto::PTODialect>();
-  builder_ = std::make_unique<mlir::OpBuilder>(context_.get());
-  module_ = mlir::ModuleOp::create(mlir::UnknownLoc::get(context_.get()));
-}
+void CodeGenPTOAS::Init() {}
 
 std::string CodeGenPTOAS::Finish() {
   std::string code;
   llvm::raw_string_ostream os(code);
-  if (module_) {
-    module_->print(os);
+  if (module) {
+    module->print(os);
   }
   return code;
+}
+
+mlir::Type CodeGenPTOAS::resolveType(const tvm::Type &type) {
+  // Check if it's a PointerType
+  if (const auto * ptrNode = type.as<tvm::PointerTypeNode>()) {
+    mlir::Type elementType = resolveType(ptrNode->element_type);
+    return mlir::pto::PtrType::get(&context, elementType);
+  }
+
+  // If it's a PrimType, extract the DataType and resolve it
+  if (const auto *primNode = type.as<tvm::PrimTypeNode>()) {
+    return resolvePrimitiveType(primNode->dtype);
+  }
+
+  LOG(FATAL) << "Unsupported type: " << type;
+}
+
+mlir::Type CodeGenPTOAS::resolvePrimitiveType(const tvm::runtime::DataType &dtype) {
+  // Handle Integer/UInt
+  if (dtype.is_int() || dtype.is_uint()) {
+    return builder.getIntegerType(dtype.bits(), dtype.is_int());
+  } else if (dtype.is_float16()) {
+    return builder.getF16Type();
+  } else if (dtype.is_bfloat16()) {
+    return builder.getBF16Type();
+  } else if (dtype.is_float()) {
+    return builder.getF32Type();
+  } else {
+    LOG(FATAL) << "Unsupported data type: " << dtype;
+    return nullptr;
+  }
 }
 
 } // namespace codegen
@@ -2163,104 +2192,47 @@ void CodeGenTileLangPTOAS::PrintHostFunc(const PrimFunc &f, const std::string &n
   std::string content = os.str();
 }
 
-void CodeGenTileLangPTOAS::AddFunction(const GlobalVar &gvar,
-                                        const PrimFunc &f) {
-  CodeGenC::DeclareFunction(gvar, f);
-  // clear previous generated state.
-  this->InitFuncState(f);
+void CodeGenTileLangPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
+  builder.setInsertionPointToEnd(module->getBody());
+  mlir::Location loc = builder.getUnknownLoc();
 
-  auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
+  llvm::SmallVector<mlir::Type, 4> argTypes;
 
-  address_map_ = f->GetAttr<Map<Var, PrimExpr>>("address_map").value_or(Map<Var, PrimExpr>());
-  use_swizzle_ = f->GetAttr<Bool>("use_swizzle").value_or(Bool(false));
-  // tiling_map_ = f->GetAttr<Map<Var, PrimExpr>>("tiling_map").value_or(Map<Var, PrimExpr>());
-  buffer_shapess_ = f->GetAttr<Map<Var, Array<PrimExpr>>>("buffer_shapess").value_or(Map<Var, Array<PrimExpr>>());
-  var_sequence_ = f->GetAttr<Array<Var>>("var_sequence").value_or(Array<Var>());
-  ICHECK(global_symbol.defined())
-      << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
-  bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
-
-  this->PrintFuncPrefix(stream);
-  this->stream << "AICORE ";
-  CodeGenC::PrintType(f->ret_type, stream);
-
-  auto func_name = static_cast<std::string>(global_symbol.value()) + "_kernel";
-  this->stream << " " << func_name << "(";
-  std::vector<const tir::VarNode *> shape_vars;
-
-  for (size_t i = 0; i < f->params.size(); ++i) {
-    tir::Var v = f->params[i];
-    std::string vid = AllocVarID(v.get());
-    if (f->buffer_map.find(v) != f->buffer_map.end()) {
-      tir::Buffer buffer = f->buffer_map[v];
-      for (size_t j = 0; j < buffer->shape.size(); j++) {
-          auto shape_var = buffer->shape[j].as<VarNode>();
-          if ((std::find(shape_vars.begin(), shape_vars.end(), shape_var) ==
-               shape_vars.end()) && shape_var != 0) {
-              (void)AllocVarID(shape_var);
-              shape_vars.push_back(shape_var);
-          }
-      }
+  for (const auto &param : func->params) {
+    // 1. Check buffer_map first for high-level buffer info
+    if (func->buffer_map.count(param)) {
+      Buffer buf = func->buffer_map.at(param);
+      mlir::Type elemType = resolvePrimitiveType(buf->dtype);
+      argTypes.push_back(mlir::pto::PtrType::get(&context, elemType));
     }
-
-    if (i != 0)
-      stream << ", ";
-    if (v.dtype().is_handle()) {
-      auto real_v = f->buffer_map[v]->data;
-      this->para_.push_back(vid);
-      // vid = AllocVarID(real_v.get());
-      this->para_.push_back(AllocVarID(real_v.get()));
-      this->para_.push_back(getType(f->buffer_map[v]->dtype));
-      Array<String> copy_tmp_shape = {};
-      String shape_type = "static";
-      for (size_t i = 0; i < f->buffer_map[v]->shape.size(); i++) {
-        std::string shape_info = PrintExpr(f->buffer_map[v]->shape[i]);
-        copy_tmp_shape.push_back(shape_info);
-        if(shape_info[0]<'1' || shape_info[0]>'9') shape_type = "dynamic";
-      }
-      global_tensor gt = {shape_type, String(getType(f->buffer_map[v]->dtype)), copy_tmp_shape};
-      global_tensor_template[String(vid)] = gt;
-
-      PrintRestrict(v, stream);
-
-      auto it = alloc_storage_scope_.find(v.get());
-      if (it != alloc_storage_scope_.end()) {
-        PrintStorageScope(it->second, stream);
-      }
-
-      if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
-        if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-          RegisterHandleType(v.get(), prim->dtype);
-        }
-      }
-
-    } else {
-      CodeGenC::PrintType(GetType(v), stream);
+    // 2. Otherwise, look at the Var's type_annotation for nested pointers
+    else if (param->type_annotation.defined()) {
+      argTypes.push_back(resolveType(param->type_annotation));
     }
-    stream <<  "__gm__ " << getType(f->buffer_map[v]->dtype) << " *" << vid;
-  }
-  size_t index = 0;
-  if (shape_vars.size() != 0 && f->params.size() != 0) {
-      stream << ", ";
-  }
-  for (auto shape_var : shape_vars) {
-      stream << "int64_t" << " " << GetVarID(shape_var);
-      if (index != shape_vars.size() - 1) {
-          stream << ", ";
-      }
-      index++;
+    // 3. Fallback to basic DataType
+    else {
+      argTypes.push_back(resolvePrimitiveType(param->dtype));
+    }
   }
 
-  stream << ", uint64_t ffts_Addr) {\n";
-  this->PreFunctionBody(f);
-  int func_scope = this->BeginScope();
-  this->PrintStmt(f->body);
-  this->EndScope(func_scope);
-  this->PrintIndent();
-  this->stream << "}\n\n";
+  std::string funcName = gvar->name_hint.operator std::string();
+  auto funcType = builder.getFunctionType(argTypes, {});
+  auto funcOp = builder.create<mlir::func::FuncOp>(loc, funcName, funcType);
 
-  PrintHostFunc(f, func_name, stream, this->core_num_, shape_vars);
-  std::string content = stream.str();
+  auto *entryBlock = funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    auto param = func->params[i];
+    mlir::Value mlir_param = entryBlock->getArgument(i);
+    symbolTable[param.get()] = mlir_param;
+  }
+
+  // this->VisitStmt(func->body);
+
+  if (entryBlock->empty() || !entryBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+    builder.create<mlir::func::ReturnOp>(loc);
+  }
 }
 
 void CodeGenTileLangPTOAS::AutoBarrierCodegen(const CallNode *op) {
