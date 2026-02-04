@@ -121,6 +121,10 @@ class LibraryGenerator(object):
                 "ptoas",
                 f"{src0.name}"
             ]
+            splits = self.lib_code.split("=======")
+            host_header = splits[0]
+            self.lib_code = splits[1]
+            host_code = splits[2]
             src0.write(self.lib_code)
             src0.flush()
             try:
@@ -130,6 +134,7 @@ class LibraryGenerator(object):
 
             dst0.seek(0)
             self.lib_code = dst0.read()
+            self.lib_code = host_header + self.lib_code + host_code
 
             ccec = "dav-c310" if self.platform == 'A5' else "dav-c220"
             memory = "REGISTER_BASE" if self.platform == 'A5' else "MEMORY_BASE"
