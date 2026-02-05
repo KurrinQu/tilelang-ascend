@@ -61,7 +61,7 @@ Here we use the method of compiling from source code for installation.
     cd tilelang-ascend
 
 #### b) Compile and Install
-    bash install_ascend.sh --ptoas-root <your-ptoas-toolchain>
+    bash install_ascend.sh --llvm-root <your-llvm-toolchain> --ptoas-root <your-ptoas-toolchain>
 
 #### c) Environment Variable Setup
 

@@ -16,7 +16,8 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
-#include <mlir/Dialect/PTO/IR/PTO.h>
+#include <PTO/IR/PTO.h>
+#include <mlir/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cmath>

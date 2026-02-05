@@ -196,7 +196,6 @@ if(USE_PTOAS)
     MLIRSupport
     MLIRFuncDialect
     MLIRArithDialect
-    MLIRPTODialect
     MLIRDestinationStyleOpInterface
     MLIRAsmParser
   )
@@ -212,6 +211,19 @@ if(USE_PTOAS)
   list(APPEND TILE_LANG_LINKER_LIBS
     LLVMCore
     LLVMSupport
+  )
+
+  find_package(PTOAS REQUIRED CONFIG)
+
+  if(NOT PTOAS_FOUND)
+    message(FATAL_ERROR "PTOAS not found. Please set PTOAS_DIR.")
+  endif()
+
+  message(STATUS "PTOAS includes: ${PTOAS_INCLUDE_DIRS}")
+  list(APPEND TILE_LANG_INCLUDES ${PTOAS_INCLUDE_DIRS})
+  list(APPEND TILE_LANG_LINKER_LIBS
+    PTOAS::PTOIR
+    PTOAS::PTOTransforms
   )
 endif()
 

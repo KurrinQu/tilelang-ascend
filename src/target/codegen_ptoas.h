@@ -13,7 +13,7 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
-#include <mlir/Dialect/PTO/IR/PTO.h>
+#include <PTO/IR/PTO.h>
 
 #include <tvm/target/codegen.h>
 #include <tvm/tir/expr.h>
