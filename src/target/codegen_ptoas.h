@@ -16,17 +16,21 @@
 #include <PTO/IR/PTO.h>
 
 #include <tvm/target/codegen.h>
+#include <tvm/tir/function.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/expr_functor.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <string>
 #include <unordered_map>
 
-#include "target/source/codegen_c.h"
+#include "codegen_ascend_pto.h"
 
 namespace tvm {
 namespace codegen {
+
+using namespace tir;
 
 class CodeGenPTOAS : public tvm::tir::ExprFunctor<mlir::Value(const tvm::PrimExpr&)>,
                      public tvm::tir::StmtFunctor<void(const tvm::tir::Stmt&)> {
@@ -35,6 +39,7 @@ public:
   virtual ~CodeGenPTOAS();
   virtual void Init();
   virtual std::string Finish();
+  std::string GetHostFn() const { return hostfn; }
 
   // Resolves MLIR type from TVM Type (which can be PointerType)
   mlir::Type resolveType(const tvm::Type &type);
@@ -86,9 +91,14 @@ public:
   mlir::Value VisitExpr_(const FloorModNode *op) final;
 
 public:
+  struct cgsymbol {
+    bool need_reshape_for_reduce = false;
+    mlir::Value sym;
+  };
   // MLIR specific helpers
   mlir::Value CallExternCodegen(const CallNode *op);
   mlir::Value GetAsTile(const PrimExpr &op);
+  const tvm::tir::VarNode* GetBufferVar(const PrimExpr &op);
 
   void UbShapeInputCheck(const AllocateNode *op);
   bool ValidLayoutEnabled(const AllocateNode *op);
@@ -100,13 +110,16 @@ public:
   mlir::MLIRContext context;
   mlir::OpBuilder builder;
   mlir::OwningOpRef<mlir::ModuleOp> module;
-  std::unordered_map<const tvm::tir::VarNode*, mlir::Value> symbolTable;
+  std::unordered_map<const tvm::tir::VarNode*, cgsymbol> symbolTable;
   std::unordered_map<const tvm::tir::VarNode*, resolvedBuffer> bufferTable;
   std::string source_scope;
 
 private:
   Map<Var, PrimExpr> address_map_;
   Map<Var, Array<PrimExpr>> buffer_shapes_;
+  std::string core_num_;
+  CodeGenTileLangAscendPto CGC;
+  std::string hostfn;
 };
 
 class CodeGenTileLangPTOAS final : public CodeGenPTOAS {

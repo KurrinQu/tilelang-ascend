@@ -41,7 +41,7 @@
 namespace tvm {
 namespace codegen {
 
-CodeGenPTOAS::CodeGenPTOAS() : builder(&context) {
+CodeGenPTOAS::CodeGenPTOAS() : builder(&context), CGC("A5") {
   context.loadDialect<mlir::func::FuncDialect,
                       mlir::arith::ArithDialect,
                       mlir::pto::PTODialect,
@@ -57,6 +57,9 @@ std::string CodeGenPTOAS::Finish() {
   if (mlir::failed(mlir::verify(*module))) {
     LOG(ERROR) << "Module verification failed.";
   }
+  os << "#include \"acl/acl.h\"\n";
+  os << "#include <runtime/rt_ffts.h>\n";
+  os << "=======\n";
   if (module) {
     module->print(os);
   }
@@ -294,7 +297,7 @@ void CodeGenPTOAS::VisitStmt_(const LetStmtNode *op) {
   if (!value) {
     LOG(FATAL) << "Failed to generate value for LetStmt: " << op->var->name_hint;
   }
-  symbolTable[op->var.get()] = value;
+  symbolTable[op->var.get()].sym = value;
   VisitStmt(op->body);
 }
 
@@ -306,6 +309,7 @@ void CodeGenPTOAS::VisitStmt_(const AttrStmtNode *op) {
     mlir::Value rawIdx;
     if (iv->thread_tag == "blockIdx.x") {
       rawIdx = builder.create<mlir::pto::GetBlockIdxOp>(loc).getResult();
+      core_num_ = CGC.PrintExpr(op->value);
     } else if (iv->thread_tag == "blockIdx.y") {
       rawIdx = builder.create<mlir::pto::GetSubBlockIdxOp>(loc).getResult();
     } else {
@@ -320,7 +324,7 @@ void CodeGenPTOAS::VisitStmt_(const AttrStmtNode *op) {
     if (!idxVal) {
       LOG(FATAL) << "Failed to convert block index value for " << iv->var->name_hint;
     }
-    symbolTable[iv->var.get()] = idxVal;
+    symbolTable[iv->var.get()].sym = idxVal;
     VisitStmt(op->body);
   } else if (op->attr_key == "resource_scope") {
     auto resource_id = Downcast<IntImm>(op->value)->value;
@@ -380,6 +384,11 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       gshape.push_back(eval(shape[1]));
       auto ub = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::VEC);
       auto bl = BLayoutAttr::get(&context, BLayout::RowMajor);
+      if (gshape[1] == 1) {
+        // HACK: store in rowmajor to satisfy the requirement of the 32-byte alignment of columns.
+        std::swap(gshape[0], gshape[1]);
+        symbolTable[buffer].need_reshape_for_reduce = true;
+      }
       auto sl = SLayoutAttr::get(&context, SLayout::NoneBox);
       auto pd = PadValueAttr::get(&context, PadValue::Null);
       auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
@@ -387,7 +396,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, ub, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else if (shape.size() == 1) {
       gshape.push_back(1);
       gshape.push_back(eval(shape[0]));
@@ -400,7 +409,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, ub, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else {
       LOG(FATAL) << "Only 2D shared memory allocation is supported, got shape size: " << shape.size();
     }
@@ -417,7 +426,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, mat, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else {
       LOG(FATAL) << "Only 2D dynamic shared memory allocation is supported, got shape size: " << shape.size();
     }
@@ -434,7 +443,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, acc, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else {
       LOG(FATAL) << "Only 2D WMMA accumulator memory allocation is supported, got shape size: " << shape.size();
     }
@@ -451,7 +460,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, left, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else {
       LOG(FATAL) << "Only 2D WMMA matrix A memory allocation is supported, got shape size: " << shape.size();
     }
@@ -467,7 +476,7 @@ void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
       auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
       auto tile = mlir::pto::TileBufType::get(&context, gshape, type, right, gshape, cfg);
       auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
-      symbolTable[buffer] = alloca.getResult();
+      symbolTable[buffer].sym = alloca.getResult();
     } else {
       LOG(FATAL) << "Only 2D WMMA matrix B memory allocation is supported, got shape size: " << shape.size();
     }
@@ -497,7 +506,7 @@ static void GenLoopUnroll(CodeGenPTOAS *self, const ForNode *op) {
         loc,
         self->resolveArithType(op->loop_var.dtype()),
         self->builder.getIntegerAttr(self->resolveArithType(op->loop_var.dtype()), min + i)).getResult();
-    self->symbolTable[op->loop_var.get()] = loopVar;
+    self->symbolTable[op->loop_var.get()].sym = loopVar;
     self->VisitStmt(op->body);
   }
 }
@@ -529,7 +538,7 @@ static void GenLoopNormal(CodeGenPTOAS *self, const ForNode *op) {
     if (!iv_cast) {
       LOG(FATAL) << "Failed to cast induction variable for " << op->loop_var->name_hint;
     }
-    self->symbolTable[op->loop_var.get()] = iv_cast;
+    self->symbolTable[op->loop_var.get()].sym = iv_cast;
 
     // Emit loop body
     self->VisitStmt(op->body);
@@ -552,7 +561,7 @@ void CodeGenPTOAS::VisitStmt_(const ForNode *op) {
 mlir::Value CodeGenPTOAS::VisitExpr_(const BufferLoadNode *op) {
   mlir::Location loc = builder.getUnknownLoc();
   std::string scope = op->buffer.scope();
-  auto sym = symbolTable[op->buffer->data.get()];
+  auto sym = symbolTable[op->buffer->data.get()].sym;
   auto off = CastVal(builder, loc, VisitExpr(op->indices.back()), builder.getIndexType(), false);
   auto dtype = resolveArithType(op->dtype);
   if (scope == "" || scope == "global") {
@@ -571,7 +580,7 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const IntImmNode *op) {
 
 mlir::Value CodeGenPTOAS::VisitExpr_(const VarNode *op) {
   if (symbolTable.count(op)) {
-    return symbolTable.at(op);
+    return symbolTable.at(op).sym;
   } else {
     LOG(FATAL) << "Undefined variable: " << op->name_hint;
     return nullptr;
@@ -612,13 +621,48 @@ static mlir::pto::PIPE GetPipe(const std::string &pipe_name) {
   }
 }
 
+static std::map<std::string, std::string> extractTemplateParams(const std::string& input) {
+    std::map<std::string, std::string> result;
+    size_t start = input.find('<');
+    size_t end = input.rfind('>');
+
+    if (start == std::string::npos || end == std::string::npos || start >= end) {
+        return result;
+    }
+    std::string inner = input.substr(start + 1, end - start - 1);
+    std::vector<std::string> params;
+    std::stringstream ss(inner);
+    std::string param;
+    while (std::getline(ss, param, ',')) {
+        param.erase(0, param.find_first_not_of(" \t"));
+        param.erase(param.find_last_not_of(" \t") + 1);
+        params.push_back(param);
+    }
+    std::vector<std::string> paramNames = {
+        "data_type_input",
+        "data_type_output",
+        "M",
+        "N",
+        "K",
+        "transpose_A",
+        "transpose_B"
+    };
+    for (size_t i = 0; i < params.size() && i < paramNames.size(); ++i) {
+        result[paramNames[i]] = params[i];
+    }
+    for (size_t i = paramNames.size(); i < params.size(); ++i) {
+        result["extra_param_" + std::to_string(i - paramNames.size() + 1)] = params[i];
+    }
+    return result;
+}
+
 mlir::Value CodeGenPTOAS::GetAsTile(const PrimExpr &op) {
   ICHECK(op.as<CallNode>()->op.same_as(builtin::tvm_access_ptr())) << "Illegal tile descriptor.";
   auto buffer = op.as<CallNode>()->args[1].as<VarNode>();
   auto offset = op.as<CallNode>()->args[2];
   auto [succ, offval] = try_eval(offset);
   if (offval != 0) {
-    auto src = symbolTable.at(buffer);
+    auto src = symbolTable.at(buffer).sym;
     auto loc = builder.getUnknownLoc();
     auto ttype = llvm::cast<mlir::pto::TileBufType>(src.getType());
     auto sizes = ttype.getShape();
@@ -628,8 +672,14 @@ mlir::Value CodeGenPTOAS::GetAsTile(const PrimExpr &op) {
     auto tile = builder.create<mlir::pto::SubsetOp>(loc, src, offsets, builder.getI64ArrayAttr(sizes)).getResult();
     return tile;
   }
-  ICHECK(symbolTable.count(buffer) && symbolTable.at(buffer)) << "undefined tile buffer.";
-  return symbolTable.at(buffer);
+  ICHECK(symbolTable.count(buffer) && symbolTable.at(buffer).sym) << "undefined tile buffer.";
+  return symbolTable.at(buffer).sym;
+}
+
+const tvm::tir::VarNode* CodeGenPTOAS::GetBufferVar(const PrimExpr &op) {
+  ICHECK(op.as<CallNode>()->op.same_as(builtin::tvm_access_ptr())) << "Illegal tile descriptor.";
+  auto buffer = op.as<CallNode>()->args[1].as<VarNode>();
+  return buffer;
 }
 
 mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
@@ -661,6 +711,9 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
       LOG(FATAL) << "Specifying pipe name in wait_cross_flag is not supported yet.";
     }
     builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
+    if (this->source_scope == "CUBE") {
+      builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag + 16));
+    }
     return mlir::Value();
   }
 
@@ -669,6 +722,9 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
     auto flag = Downcast<IntImm>(op->args[1])->value;
     mlir::pto::PIPE pipe = GetPipe(pstr);
     builder.create<mlir::pto::SyncSetOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
+    if (this->source_scope == "CUBE") {
+      builder.create<mlir::pto::SyncSetOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag + 16));
+    }
     return mlir::Value();
   }
 
@@ -680,16 +736,73 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
   }
 
   if (op->op.same_as(tl::ascend_gemm_v0())) {
+    auto MTE2 = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_MTE2);
+    auto MTE1 = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_MTE1);
+    auto M = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_M);
+    auto E0 = mlir::pto::EventAttr::get(&context, mlir::pto::EVENT::EVENT_ID0);
+    builder.create<mlir::pto::SetFlagOp>(loc, MTE2, MTE1, E0);
+    builder.create<mlir::pto::WaitFlagOp>(loc, MTE2, MTE1, E0);
+
     auto a = GetAsTile(op->args[1]);
     auto b = GetAsTile(op->args[2]);
     auto c = GetAsTile(op->args[3]);
     auto clear = eval(op->args[4]);
+    std::string op_name = Downcast<StringImm>(op->args[0])->value;
+    std::map<std::string, std::string> params = extractTemplateParams(op_name);
+    auto atype = llvm::cast<mlir::pto::TileBufType>(a.getType()).getElementType();
+    auto btype = llvm::cast<mlir::pto::TileBufType>(b.getType()).getElementType();
     auto dtype = llvm::cast<mlir::pto::TileBufType>(c.getType()).getElementType();
     auto restype = mlir::RankedTensorType::get(mlir::cast<mlir::pto::TileBufType>(c.getType()).getShape(), dtype);
+
+    auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+    auto pad = PadValueAttr::get(&context, PadValue::Null);
+    auto browmajor = BLayoutAttr::get(&context, BLayout::RowMajor);
+    auto bcolmajor = BLayoutAttr::get(&context, BLayout::ColMajor);
+    auto srowmajor = SLayoutAttr::get(&context, SLayout::RowMajor);
+    auto scolmajor = SLayoutAttr::get(&context, SLayout::ColMajor);
+    auto left = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::LEFT);
+    auto right = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::RIGHT);
+    auto mat = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::MAT);
+
+    auto ashape = llvm::cast<mlir::pto::TileBufType>(a.getType()).getShape();
+    std::vector<int64_t> l0ashape{ashape[0], ashape[1]};
+    if (params["transpose_A"] == "true") {
+      std::swap(l0ashape[0], l0ashape[1]);
+      auto Tcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+      auto Tty = mlir::pto::TileBufType::get(&context, l0ashape, atype, mat, l0ashape, Tcfg);
+      auto Ta = builder.create<mlir::pto::AllocTileOp>(loc, Tty, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, a, Ta);
+      a = Ta;
+    }
+    auto l0acfg = mlir::pto::TileBufConfigAttr::get(&context, bcolmajor, srowmajor, fractal, pad);
+    auto l0aty = mlir::pto::TileBufType::get(&context, l0ashape, atype, left, l0ashape, l0acfg);
+    auto l0a = builder.create<mlir::pto::AllocTileOp>(loc, l0aty, mlir::Value(), mlir::Value()).getResult();
+    auto l0aresty = mlir::RankedTensorType::get(l0ashape, atype);
+    builder.create<mlir::pto::TMovOp>(loc, l0aresty, a, l0a);
+
+    auto bshape = llvm::cast<mlir::pto::TileBufType>(b.getType()).getShape();
+    std::vector<int64_t> l0bshape{bshape[0], bshape[1]};
+    if (params["transpose_B"] == "true") {
+      std::swap(l0bshape[0], l0bshape[1]);
+      auto Tcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+      auto Tty = mlir::pto::TileBufType::get(&context, l0bshape, atype, mat, l0bshape, Tcfg);
+      auto Tb = builder.create<mlir::pto::AllocTileOp>(loc, Tty, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, b, Tb);
+      b = Tb;
+    }
+    auto l0bcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+    auto l0bty = mlir::pto::TileBufType::get(&context, l0bshape, btype, right, l0bshape, l0bcfg);
+    auto l0b = builder.create<mlir::pto::AllocTileOp>(loc, l0bty, mlir::Value(), mlir::Value()).getResult();
+    auto l0bresty = mlir::RankedTensorType::get(l0bshape, btype);
+    builder.create<mlir::pto::TMovOp>(loc, l0bresty, b, l0b);
+
+    builder.create<mlir::pto::SetFlagOp>(loc, MTE1, M, E0);
+    builder.create<mlir::pto::WaitFlagOp>(loc, MTE1, M, E0);
+
     if (clear)
-      builder.create<mlir::pto::TMatmulOp>(loc, restype, a, b, mlir::Value(), c);
+      builder.create<mlir::pto::TMatmulOp>(loc, restype, l0a, l0b, mlir::Value(), c);
     else
-      builder.create<mlir::pto::TMatmulAccOp>(loc, restype, c, a, b, c);
+      builder.create<mlir::pto::TMatmulAccOp>(loc, restype, c, l0a, l0b, c);
     return mlir::Value();
   }
 
@@ -766,19 +879,81 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
     auto rdim = std::get<2>(templates);
     auto res = GetAsTile(op->args[1]);
     auto src = GetAsTile(op->args[2]);
+
+    // build tmp buffer
+    auto tmpdtype = llvm::cast<mlir::pto::TileBufType>(src.getType()).getElementType();
+    auto tmpcfg = llvm::cast<mlir::pto::TileBufType>(src.getType()).getConfig();
+    auto tmpspace = llvm::cast<mlir::pto::TileBufType>(src.getType()).getMemorySpace();
+    auto shape = llvm::cast<mlir::pto::TileBufType>(src.getType()).getShape();
+    ICHECK(shape.size() == 2) << "Only 2D reduction is supported.";
+    std::vector<int64_t> tmpshape(2);
+    tmpshape[0] = shape[0];
+    tmpshape[1] = 256 * 8 / tmpdtype.getIntOrFloatBitWidth();
+    auto tmpty = mlir::pto::TileBufType::get(&context, tmpshape, tmpdtype, tmpspace, tmpshape, tmpcfg);
+    auto tmp = builder.create<mlir::pto::AllocTileOp>(loc, tmpty, mlir::Value(), mlir::Value()).getResult();
+
+    // maybe reshape res
+    auto origin = res;
+    if (symbolTable[GetBufferVar(op->args[1])].need_reshape_for_reduce) {
+      auto resty = llvm::cast<mlir::pto::TileBufType>(res.getType());
+      auto rmshape = resty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = resty.getElementType();
+      auto cmspace = resty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, res, cmtile);
+      res = cmtile;
+    }
     if (rdim == -1) {
       if (opname.find("reduce_sum") != std::string::npos) {
-        builder.create<mlir::pto::TRowSumOp>(loc, src, res);
-        return mlir::Value();
+        builder.create<mlir::pto::TRowSumOp>(loc, src, tmp, res);
       } else if (opname.find("reduce_max") != std::string::npos) {
-        builder.create<mlir::pto::TRowMaxOp>(loc, src, res);
-        return mlir::Value();
+        builder.create<mlir::pto::TRowMaxOp>(loc, src, tmp, res);
       } else {
         LOG(FATAL) << "Unsupported reduce operation: " << opname;
       }
     } else {
       LOG(FATAL) << "Unsupported reduce dimension: " << rdim;
     }
+    if (origin != res) {
+      builder.create<mlir::pto::TReshapeOp>(loc, res, origin);
+    }
+    return mlir::Value();
+  }
+
+  // broadcast variants
+  if (op->op.same_as(tl::ascend_broadcast())) {
+    auto res = GetAsTile(op->args[1]);
+    auto src = GetAsTile(op->args[2]);
+    // maybe reshape src
+    auto origin = src;
+    if (symbolTable[GetBufferVar(op->args[2])].need_reshape_for_reduce) {
+      auto srcty = llvm::cast<mlir::pto::TileBufType>(src.getType());
+      auto rmshape = srcty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = srcty.getElementType();
+      auto cmspace = srcty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, src, cmtile);
+      src = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandOp>(loc, src, res);
+    if (origin != src) {
+      builder.create<mlir::pto::TReshapeOp>(loc, src, origin);
+    }
+    return mlir::Value();
   }
 
   LOG(FATAL) << "Unsupported call operation: " << op->op;
@@ -1059,12 +1234,12 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const LetNode *op) {
   if (!v) return mlir::Value();
   mlir::Value prev = nullptr;
   if (symbolTable.count(varnode)) {
-    prev = symbolTable[varnode];
+    prev = symbolTable[varnode].sym;
   }
-  symbolTable[varnode] = v;
+  symbolTable[varnode].sym = v;
   mlir::Value res = VisitExpr(op->body);
   if (prev) {
-    symbolTable[varnode] = prev;
+    symbolTable[varnode].sym = prev;
   } else {
     symbolTable.erase(varnode);
   }
@@ -1112,8 +1287,13 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const FloorModNode *op) {
 
 static std::vector<mlir::Value> legalShape(CodeGenPTOAS *codegen, mlir::Location loc, const std::vector<PrimExpr> &shape) {
   std::vector<mlir::Value> legalShape;
-  for (auto dim : shape) {
-    legalShape.push_back(CastVal(codegen->builder, loc, codegen->VisitExpr(dim), codegen->builder.getIndexType(), false));
+  ICHECK(shape.size() <= 5) << "Shape with more than 5 dimensions is not supported.";
+  auto one = codegen->builder.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+  for (size_t i = 0; i < 5 - shape.size(); ++i) {
+    legalShape.push_back(one);
+  }
+  for (size_t i = 0; i < shape.size(); ++i) {
+    legalShape.push_back(CastVal(codegen->builder, loc, codegen->VisitExpr(shape[i]), codegen->builder.getIndexType(), false));
   }
   return legalShape;
 }
@@ -1171,9 +1351,9 @@ mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
       size_t op_arg_len = op->args.size();
       long cols = eval(op->args[op_arg_len - 1]);
       long rows = op_arg_len == 5 ? 1 : eval(op->args[op_arg_len - 2]);
-      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[src_var].getType());
+      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[src_var].sym.getType());
       auto dtype = ptype.getElementType();
-      auto gbase = symbolTable[src_var];
+      auto gbase = symbolTable[src_var].sym;
       auto gshape = legalShape(this, loc, bufferTable[src_var].shape);
       auto gviewtype = mlir::pto::TensorViewType::get(&context, gshape.size(), dtype);
       ICHECK(gshape.size() != 0) << "gm shape cannot be empty.";
@@ -1186,15 +1366,15 @@ mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
       auto sizes = makeSubviewSizes(builder, loc, {rows, cols}, gshape.size());
       auto gsubview = builder.create<mlir::pto::PartitionViewOp>(loc, subviewtype, gview, offsets, sizes).getResult();
       auto restype = mlir::RankedTensorType::get({rows, cols}, dtype);
-      auto tload = builder.create<mlir::pto::TLoadOp>(loc, restype, gsubview, symbolTable[dst_var]);
+      auto tload = builder.create<mlir::pto::TLoadOp>(loc, restype, gsubview, symbolTable[dst_var].sym);
       return tload.getResult();
     } else if (op_name.find("copy_ub_to_gm") != std::string::npos || op_name.find("copy_l0c_to_gm") != std::string::npos) {
       size_t op_arg_len = op->args.size();
       long cols = eval(op->args[op_arg_len - 1]);
       long rows = op_arg_len == 5 ? 1 : eval(op->args[op_arg_len - 2]);
-      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[dst_var].getType());
+      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[dst_var].sym.getType());
       auto dtype = ptype.getElementType();
-      auto gbase = symbolTable[dst_var];
+      auto gbase = symbolTable[dst_var].sym;
       auto gshape = legalShape(this, loc, bufferTable[dst_var].shape);
       auto gviewtype = mlir::pto::TensorViewType::get(&context, gshape.size(), dtype);
       ICHECK(gshape.size() != 0) << "gm shape cannot be empty.";
@@ -1207,7 +1387,7 @@ mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
       auto sizes = makeSubviewSizes(builder, loc, {rows, cols}, gshape.size());
       auto gsubview = builder.create<mlir::pto::PartitionViewOp>(loc, subviewtype, gview, offsets, sizes).getResult();
       auto restype = mlir::RankedTensorType::get({rows, cols}, dtype);
-      builder.create<mlir::pto::TStoreOp>(loc, restype, symbolTable[src_var], gsubview);
+      builder.create<mlir::pto::TStoreOp>(loc, restype, symbolTable[src_var].sym, gsubview);
       return mlir::Value();
     } else if (op_name.find("copy_ub_to_ub") != std::string::npos) {
       auto res = GetAsTile(op->args[2]);
@@ -1217,12 +1397,94 @@ mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
         auto restype = mlir::RankedTensorType::get(mlir::cast<mlir::pto::TileBufType>(res.getType()).getShape(), dtype);
         builder.create<mlir::pto::TMovOp>(loc, restype, src, res);
       } else {
+        auto round = mlir::pto::RoundModeAttr::get(&context, mlir::pto::RoundMode::NONE);
         builder.create<mlir::pto::TCvtOp>(loc, src, res);
       }
       return mlir::Value();
     } else {
       LOG(FATAL) << "Unsupported copy operation: " << op_name;
     }
+  } else if (op_name == "trowexpandsub") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandSubOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
+  } else if (op_name == "trowexpandmul") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandMulOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
+  } else if (op_name == "trowexpanddiv") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandDivOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
   } else {
     LOG(FATAL) << "Unsupported call operation: " << op_name;
   }
@@ -1247,7 +1509,94 @@ bool CodeGenPTOAS::ValidLayoutEnabled(const AllocateNode *op) {
   return valid;
 }
 
+static void ProcessHostInput(std::ostream &os, std::vector<std::string> &arg_names,
+                      llvm::SmallVectorImpl<const tir::VarNode *> &shape_vars, bool add_args = true) {
+  for (auto shape_var : shape_vars) {
+    os << ", "
+       << "int64_t " << shape_var->name_hint;
+  if (add_args)
+    { arg_names.push_back(shape_var->name_hint); }
+  }
+}
+
+static std::string ResolveCType(const DataType &dtype) {
+  if (dtype.is_float16()) {
+    return "half";
+  } else if (dtype.is_float()) {
+    return "float";
+  } else if (dtype.is_int() && dtype.bits() == 4) {
+    return "int4b_t";
+  } else if (dtype.is_int() && dtype.bits() == 8) {
+    return "int8_t";
+  } else if (dtype.is_int() && dtype.bits() == 16) {
+    return "int16_t";
+  } else if (dtype.is_int() && dtype.bits() == 32) {
+    return "int";
+  } else if (dtype.is_int() && dtype.bits() == 64) {
+    return "int64_t";
+  } else if (dtype.is_uint() && dtype.bits() == 8) {
+    return "uint8_t";
+  } else if (dtype.is_uint() && dtype.bits() == 16) {
+    return "uint16_t";
+  } else if (dtype.is_uint() && dtype.bits() == 32) {
+    return "uint32_t";
+  } else if (dtype.is_uint() && dtype.bits() == 64) {
+    return "uint64_t";
+  } else if (dtype.is_bfloat16()) {
+    return "bfloat16_t";
+  }
+  LOG(FATAL) << "Unsupported data type: " << dtype;
+  return "";
+}
+
+static std::string GenHostFunc(const PrimFunc &func, std::string &name, std::string &core, llvm::SmallVectorImpl<const tir::VarNode *> &shapeVals) {
+  std::vector<std::string> tiling_args;
+  std::string tiling_func_name = name;
+  // ProcessTilingInput(os, tiling_func_name, tiling_args, shape_vars);
+
+  std::ostringstream os;
+
+  // launch kernel
+  os << "extern \"C\" void call(";
+  std::vector<std::string> arg_names;
+  for (size_t i = 0; i < func->params.size(); ++i) { // params
+    auto v = func->params[i];
+    if (i != 0) {
+      os << ", ";
+    }
+    arg_names.push_back(v->name_hint);
+    os << "__gm__ uint8_t *" << v->name_hint;
+  }
+  ProcessHostInput(os, arg_names, shapeVals);
+  os << ", void *stream)\n{\n  ";
+  os << "  uint32_t fftsLen{0};\n  ";
+  os << "  uint64_t fftsAddr{0};\n  ";
+  os << "  rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);\n";
+  // template function
+  os << name << "<<<" << core << ", nullptr, stream>>>(";
+  for (size_t i = 0; i < func->params.size(); ++i) { // params
+    auto v = func->params[i];
+    if (i != 0) {os << ",\n     ";}
+    os << "reinterpret_cast<__gm__ ";
+    if (func->buffer_map.count(v)) {
+      Buffer buf = func->buffer_map.at(v);
+      os << ResolveCType(buf->dtype);
+    } else {
+      os << ResolveCType(v->dtype);
+    }
+    os << " *>(" << v->name_hint << ")";
+  }
+  for (auto shape_var : shapeVals) {
+    os << ", " << shape_var->name_hint;
+  }
+  os << ");\n}\n\n";
+  // os << ", fftsAddr);\n}\n\n";
+
+  return os.str();
+}
+
 void CodeGenPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
+  CGC.AddFunction(gvar, func);
   address_map_ = func->GetAttr<Map<Var, PrimExpr>>("address_map").value_or(Map<Var, PrimExpr>());
   buffer_shapes_ = func->GetAttr<Map<Var, Array<PrimExpr>>>("buffer_shapess").value_or(Map<Var, Array<PrimExpr>>());
 
@@ -1287,7 +1636,7 @@ void CodeGenPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
     argTypes.push_back(resolveArithType(dim->dtype));
   }
 
-  std::string funcName = gvar->name_hint.operator std::string();
+  std::string funcName = gvar->name_hint.operator std::string() + "_kernel";
   auto funcType = builder.getFunctionType(argTypes, {});
   auto funcOp = builder.create<mlir::func::FuncOp>(loc, funcName, funcType);
 
@@ -1307,12 +1656,12 @@ void CodeGenPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
       }
     }
     mlir::Value mlir_param = entryBlock->getArgument(i);
-    symbolTable[param.get()] = mlir_param;
+    symbolTable[param.get()].sym = mlir_param;
   }
 
   for (size_t i = 0; i < shapeVals.size(); ++i) {
     mlir::Value mlir_param = entryBlock->getArgument(func->params.size() + i);
-    symbolTable[shapeVals[i]] = mlir_param;
+    symbolTable[shapeVals[i]].sym = mlir_param;
   }
 
   this->VisitStmt(func->body);
@@ -1320,6 +1669,8 @@ void CodeGenPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
   if (entryBlock->empty() || !entryBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
     builder.create<mlir::func::ReturnOp>(loc);
   }
+
+  hostfn = GenHostFunc(func, funcName, core_num_, shapeVals);
 }
 
 } // namespace codegen
