@@ -13,36 +13,113 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
-#include <mlir/Dialect/PTO/IR/PTO.h>
+#include <PTO/IR/PTO.h>
 
 #include <tvm/target/codegen.h>
+#include <tvm/tir/function.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/expr_functor.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <string>
 #include <unordered_map>
 
-#include "target/source/codegen_c.h"
+#include "codegen_ascend_pto.h"
 
 namespace tvm {
 namespace codegen {
 
-class CodeGenPTOAS : public CodeGenC {
+using namespace tir;
+
+class CodeGenPTOAS : public tvm::tir::ExprFunctor<mlir::Value(const tvm::PrimExpr&)>,
+                     public tvm::tir::StmtFunctor<void(const tvm::tir::Stmt&)> {
 public:
   CodeGenPTOAS();
   virtual ~CodeGenPTOAS();
   virtual void Init();
   virtual std::string Finish();
+  std::string GetHostFn() const { return hostfn; }
 
   // Resolves MLIR type from TVM Type (which can be PointerType)
   mlir::Type resolveType(const tvm::Type &type);
   // Resolves MLIR type from primitive DataType
   mlir::Type resolvePrimitiveType(const tvm::runtime::DataType &dtype);
 
+  // Resolve an MLIR type that is legal for the arith dialect given a TVM DataType.
+  // (Integers are returned as signless arith-friendly IntegerType of same width;
+  // floats/index are returned unchanged.)
+  mlir::Type resolveArithType(const tvm::runtime::DataType &dtype);
+
+  void AddFunction(const GlobalVar &gvar, const PrimFunc &f);
+
+public:
+  // TVM Visitors
+  void VisitStmt_(const LetStmtNode *op) final;
+  void VisitStmt_(const AllocateNode *op) final;
+  void VisitStmt_(const AttrStmtNode *op) final;
+  void VisitStmt_(const SeqStmtNode *op) final;
+  void VisitStmt_(const EvaluateNode *op) final;
+  void VisitStmt_(const ForNode *op) final;
+
+  mlir::Value VisitExpr_(const BufferLoadNode *op) final;
+  mlir::Value VisitExpr_(const CallNode *op) final;
+  mlir::Value VisitExpr_(const VarNode *op) final;
+  mlir::Value VisitExpr_(const IntImmNode *op) final;
+  mlir::Value VisitExpr_(const CastNode *op) final;
+  mlir::Value VisitExpr_(const FloatImmNode *op) final;
+  mlir::Value VisitExpr_(const StringImmNode *op) final;
+  mlir::Value VisitExpr_(const AddNode *op) final;
+  mlir::Value VisitExpr_(const SubNode *op) final;
+  mlir::Value VisitExpr_(const MulNode *op) final;
+  mlir::Value VisitExpr_(const DivNode *op) final;
+  mlir::Value VisitExpr_(const ModNode *op) final;
+  mlir::Value VisitExpr_(const MinNode *op) final;
+  mlir::Value VisitExpr_(const MaxNode *op) final;
+  mlir::Value VisitExpr_(const LTNode *op) final;
+  mlir::Value VisitExpr_(const LENode *op) final;
+  mlir::Value VisitExpr_(const GTNode *op) final;
+  mlir::Value VisitExpr_(const GENode *op) final;
+  mlir::Value VisitExpr_(const EQNode *op) final;
+  mlir::Value VisitExpr_(const NENode *op) final;
+  mlir::Value VisitExpr_(const AndNode *op) final;
+  mlir::Value VisitExpr_(const OrNode *op) final;
+  mlir::Value VisitExpr_(const NotNode *op) final;
+  mlir::Value VisitExpr_(const SelectNode *op) final;
+  mlir::Value VisitExpr_(const LetNode *op) final;
+  mlir::Value VisitExpr_(const FloorDivNode *op) final;
+  mlir::Value VisitExpr_(const FloorModNode *op) final;
+
+public:
+  struct cgsymbol {
+    bool need_reshape_for_reduce = false;
+    mlir::Value sym;
+  };
+  // MLIR specific helpers
+  mlir::Value CallExternCodegen(const CallNode *op);
+  mlir::Value GetAsTile(const PrimExpr &op);
+  const tvm::tir::VarNode* GetBufferVar(const PrimExpr &op);
+
+  void UbShapeInputCheck(const AllocateNode *op);
+  bool ValidLayoutEnabled(const AllocateNode *op);
+
+  struct resolvedBuffer {
+    std::vector<PrimExpr> shape;
+  };
+
   mlir::MLIRContext context;
   mlir::OpBuilder builder;
   mlir::OwningOpRef<mlir::ModuleOp> module;
-  std::unordered_map<const tvm::tir::VarNode*, mlir::Value> symbolTable;
+  std::unordered_map<const tvm::tir::VarNode*, cgsymbol> symbolTable;
+  std::unordered_map<const tvm::tir::VarNode*, resolvedBuffer> bufferTable;
+  std::string source_scope;
+
+private:
+  Map<Var, PrimExpr> address_map_;
+  Map<Var, Array<PrimExpr>> buffer_shapes_;
+  std::string core_num_;
+  CodeGenTileLangAscendPto CGC;
+  std::string hostfn;
 };
 
 class CodeGenTileLangPTOAS final : public CodeGenPTOAS {
@@ -50,157 +127,6 @@ public:
   using super = CodeGenPTOAS;
   CodeGenTileLangPTOAS(std::string platform);
   std::string Finish();
-  // override behavior
-  void PrintFuncPrefix(std::ostream &os) final;
-  void PrintExtraAttrs(const PrimFunc &f);
-  void PreFunctionBody(const PrimFunc &f) final;
-  void VisitStmt_(const ForNode *op) final;
-  void PrintStorageScope(const std::string &scope,
-                         std::ostream &os) final;     // NOLINT(*)
-  void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
-  void ProcessTilingInput(std::ostream &os, std::string func_name, std::vector<std::string> &arg_names,
-    std::vector<const tir::VarNode*> &shape_vars);
-  void CallTilingInput(std::ostream &os, std::string func_name, std::vector<std::string> &tiling_args,
-    std::vector<const tir::VarNode*> &shape_vars);
-  void PrintHostFunc(const PrimFunc &f, const std::string &name, std::ostringstream &os,
-                     std::string &core,
-                     std::vector<const tir::VarNode*> &shape_vars);
-
-  // overload visitor
-  void VisitExpr_(const FloatImmNode *op, std::ostream &os) final;
-  void VisitExpr_(const CallNode *op, std::ostream &os) final;
-  void VisitExpr_(const FloorDivNode *op, std::ostream &os);
-  void VisitExpr_(const FloorModNode *op, std::ostream &os);
-  void VisitExpr_(const SelectNode *op, std::ostream &os) final;
-  void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
-  void VisitStmt_(const BufferStoreNode *op) final;
-  void VisitStmt_(const AllocateNode *op) final;
-  void VisitStmt_(const AttrStmtNode *op) final;
-
-  void UnaryVecOpCodegen(const CallNode *op, const std::string& op_name);
-  void ScalarOpCodegen(const CallNode *op, const std::string& op_name);
-  void BinaryVecClampOpsCodegen(const CallNode *op, const std::string& op_name);
-  void CastCodegen(const CallNode *op, const std::string& op_type);
-  void ReduceOpCodegen(const CallNode *op);
-
-  // Override this as a work around for __grid_constant__ parameter
-  void AddFunction(const GlobalVar &gvar, const PrimFunc &f);
-
-private:
-  void AutoBarrierCodegen (const CallNode *op);
-  void AutoFlagOpCodegen (const CallNode *op, std::string op_name);
-
-private:
-  // Whether scope such as "__shared__" or "__constant__"  is part of type.
-  bool IsScopePartOfType() const final { return false; }
-
-  friend void PrintConst(const FloatImmNode *op, std::ostream &os,
-                         CodeGenTileLangPTOAS *p);
-
-  friend void PrintConst(const FloatImmNode *op, std::ostream &os,
-                         CodeGenTileLangPTOAS *p);
-  
-  void BinaryVecOpCodegen(const CallNode* op, const std::string& op_name);
-
-  void BinaryVecOpsCodegen(const CallNode* op, const std::string& op_name);
-
-  void CallExternCodegen(const CallNode *op);
-
-  void GemmV0Codegen(const CallNode *op);
-
-  void PipeBarrierCodegen(const CallNode *op);
-
-  void SetAndWaitFlagCodegen(const CallNode *op, const std::string &op_name);
-
-  void HandleA5Flag(const std::string &op, const std::string &pipe, int flag);
-
-  void SetCrossFlagCodegen(const CallNode *op);
-
-  void AutoSetCrossFlagCodegen(const CallNode *op);
-
-  void WaitCrossFlagCodegen(const CallNode *op);
-
-  void FillCodegen(const CallNode *op);
-
-  void CreateVecIndexCodegen(const CallNode *op, const std::string &op_name);
-
-  void GatherbCodegen(const CallNode *op, const std::string &op_name);
-
-  void PowCodegen(const CallNode *op);
-
-  void Sort32Codegen(const CallNode *op, const std::string &op_name);
-
-  void TransposeCodegen(const CallNode *op, const std::string &op_name);
-
-  void XorCodegen(const CallNode *op, const std::string &op_name);
-
-  void CompareCodegen(const CallNode *op, const std::string &op_name);
-
-  void CompareScalarCodegen(const CallNode *op, const std::string &op_name);
-
-  std::string PrintBufferOffset(const CallNode *op);
-  void UbShapeInputCheck(const AllocateNode *op);
-  bool ValidLayoutEnabled(const AllocateNode *op);
-
-  // Whether global barrier is needed.
-  bool need_global_barrier_{false};
-  // Global barrier state
-  std::string vid_global_barrier_state_;
-  // Global barrier expected node.
-  std::string vid_global_barrier_expect_;
-  // whether enable fp16
-  bool enable_fp16_{false};
-  // whether enable bf16
-  bool enable_bf16_{false};
-  // whether enable fp8
-  bool enable_fp8_{false};
-  // whether enable int8
-  bool enable_int8_{false};
-  // whether enable warp shuffle intrinsics
-  bool enable_warp_shuffle_{false};
-  // whether need math_constants.h
-  bool need_math_constants_h_{false};
-  // whether need cast_smem_ptr_to_int helper function
-  bool need_cast_smem_ptr_to_int_{false};
-
-  std::vector<std::string> inst_;
-  bool flush_out_{false};
-
-  std::string core_num_{0};
-
-  std::vector<std::string> para_;
-
-  std::string block_id_;
-  std::string vec_id_;
-
-  Map<Var, PrimExpr> address_map_;
-  Map<Var, Array<PrimExpr>> buffer_shapess_;
-
-  Map<Var, PrimExpr> tiling_map_;
-  Array<Var> var_sequence_;
-
-  Map<String, PrimExpr> address_offset_;
-
-  Map<String, String> copy_tmplte_map_;
-  Map<String, String> copy_base_addr_map_;
-  
-  std::map<std::string, std::vector<std::string>> ub_data_map_;
-  std::map<std::string, std::vector<std::string>> l_data_map_;
-  std::map<std::string, std::string> for_num_map_;
-  std::map<std::string, std::pair<int, int>> prefetch_n_stages_map_;
-  
-  struct global_tensor{
-    String shape_type;
-    String dtype;
-    Array<String> shape_list;
-  };
-  std::unordered_map<String, global_tensor> global_tensor_template;
-
-  bool use_swizzle_{false};
-
-  std::string platform_;
-
-  std::string current_resource_scope_ = ""; // 标识是CUBE还是VEC
 };
 
 } // namespace codegen

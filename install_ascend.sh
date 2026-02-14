@@ -20,9 +20,13 @@ while [[ $# -gt 0 ]]; do
             PTOAS_ROOT="$2"
             shift 2
             ;;
+        --llvm-root)
+            LLVM_ROOT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--enable-llvm] [--enable-shmem] [--ptoas-root <path>]"
+            echo "Usage: $0 [--enable-llvm] [--enable-shmem] [--ptoas-root <path>] [--llvm-root <path>]"
             exit 1
             ;;
     esac
@@ -54,7 +58,6 @@ else
     echo "Python requirements installed successfully."
 fi
 
-CMAKE_OPTIONS=""
 
 # Step 2: Define LLVM version and architecture
 if $USE_LLVM; then
@@ -136,11 +139,17 @@ cd build
 echo "set(USE_ASCEND ON)" >> config.cmake
 echo "set(USE_PTOAS ON)" >> config.cmake
 
-if [[ -n "$PTOAS_ROOT" ]]; then
-    MLIR_DIR=${PTOAS_ROOT}/lib/cmake/mlir
-    LLVM_DIR=${PTOAS_ROOT}/lib/cmake/llvm
+if [[ -n "$LLVM_ROOT" ]]; then
+    MLIR_DIR=${LLVM_ROOT}/lib/cmake/mlir
+    LLVM_DIR=${LLVM_ROOT}/lib/cmake/llvm
     echo "set(MLIR_DIR ${MLIR_DIR})" >> config.cmake
     echo "set(LLVM_DIR ${LLVM_DIR})" >> config.cmake
+    echo "Using LLVM root at: $LLVM_ROOT"
+fi
+
+if [[ -n "$PTOAS_ROOT" ]]; then
+    PTOAS_DIR=${PTOAS_ROOT}/install/lib/cmake/PTOAS
+    echo "set(PTOAS_DIR ${PTOAS_DIR})" >> config.cmake
     echo "Using PTOAS root at: $PTOAS_ROOT"
 fi
 

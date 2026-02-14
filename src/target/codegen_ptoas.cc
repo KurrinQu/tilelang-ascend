@@ -16,7 +16,9 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
-#include <mlir/Dialect/PTO/IR/PTO.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
+#include <PTO/IR/PTO.h>
+#include <mlir/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <cmath>
@@ -38,10 +40,12 @@
 
 namespace tvm {
 namespace codegen {
-CodeGenPTOAS::CodeGenPTOAS() : builder(&context) {
+
+CodeGenPTOAS::CodeGenPTOAS() : builder(&context), CGC("A5") {
   context.loadDialect<mlir::func::FuncDialect,
                       mlir::arith::ArithDialect,
-                      mlir::pto::PTODialect>();
+                      mlir::pto::PTODialect,
+                      mlir::scf::SCFDialect>();
   module = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
 };
 CodeGenPTOAS::~CodeGenPTOAS() = default;
@@ -50,6 +54,12 @@ void CodeGenPTOAS::Init() {}
 std::string CodeGenPTOAS::Finish() {
   std::string code;
   llvm::raw_string_ostream os(code);
+  if (mlir::failed(mlir::verify(*module))) {
+    LOG(ERROR) << "Module verification failed.";
+  }
+  os << "#include \"acl/acl.h\"\n";
+  os << "#include <runtime/rt_ffts.h>\n";
+  os << "=======\n";
   if (module) {
     module->print(os);
   }
@@ -65,7 +75,7 @@ mlir::Type CodeGenPTOAS::resolveType(const tvm::Type &type) {
 
   // If it's a PrimType, extract the DataType and resolve it
   if (const auto *primNode = type.as<tvm::PrimTypeNode>()) {
-    return resolvePrimitiveType(primNode->dtype);
+    return resolveArithType(primNode->dtype);
   }
 
   LOG(FATAL) << "Unsupported type: " << type;
@@ -85,1364 +95,6 @@ mlir::Type CodeGenPTOAS::resolvePrimitiveType(const tvm::runtime::DataType &dtyp
     LOG(FATAL) << "Unsupported data type: " << dtype;
     return nullptr;
   }
-}
-
-} // namespace codegen
-} // namespace tvm
-
-namespace tvm {
-namespace codegen {
-  const std::string kAscendPtoScope = "tl::ascend_pto::";
-
-static std::string getType(const DataType &dtype) {
-  if (dtype.is_float16()) {
-    return "half";
-  } else if (dtype.is_float()) {
-    return "float";
-  } else if (dtype.is_int() && dtype.bits() == 4) {
-    return "int4b_t";
-  } else if (dtype.is_int() && dtype.bits() == 8) {
-    return "int8_t";
-  } else if (dtype.is_int() && dtype.bits() == 16) {
-    return "int16_t";
-  } else if (dtype.is_int() && dtype.bits() == 32) {
-    return "int";
-  } else if (dtype.is_int() && dtype.bits() == 64) {
-    return "int64_t";
-  } else if (dtype.is_uint() && dtype.bits() == 8) {
-    return "uint8_t";
-  } else if (dtype.is_uint() && dtype.bits() == 16) {
-    return "uint16_t";
-  } else if (dtype.is_uint() && dtype.bits() == 32) {
-    return "uint32_t";
-  } else if (dtype.is_uint() && dtype.bits() == 64) {
-    return "uint64_t";
-  } else if (dtype.is_bfloat16()) {
-    return "bfloat16_t";
-  }
-  LOG(FATAL) << "Unsupported data type: " << dtype;
-  return "";
-}
-
-static int8_t GetTypeLen(std::string type) {
-  int8_t typeSize = 1;
-  if (type == "float") {
-    typeSize = 4;
-  } else if (type == "bfloat16_t") {
-    typeSize = 2;
-  } else if (type == "half") {
-    typeSize = 2;
-  } else if (type == "int8_t" || type == "uint8_t") {
-    typeSize = 1;
-  } else if (type == "int16_t" || type == "uint16_t") {
-    typeSize = 2;
-  } else if (type == "int" || type == "uint32_t") {
-    typeSize = 4;
-  } else {
-    ICHECK(false) << "Unsupported datatype";
-  }
-  return typeSize;
-}
-
-static std::string GetTypeLenString(std::string type) {
-  std::string typeSize = "1";
-  if (type == "float") {
-    typeSize = "4";
-  } else if (type == "bfloat16_t") {
-    typeSize = "2";
-  } else if (type == "half") {
-    typeSize = "2";
-  } else if (type == "int8_t" || type == "uint8_t") {
-    typeSize = "1";
-  } else if (type == "int16_t" || type == "uint16_t") {
-    typeSize = "2";
-  } else if (type == "int" || type == "uint32_t") {
-    typeSize = "4";
-  } else {
-    ICHECK(false) << "Unsupported datatype";
-  }
-  return typeSize;
-}
-
-CodeGenTileLangPTOAS::CodeGenTileLangPTOAS(std::string platform) {
-  // restrict_keyword_ = "__gm__ uint8_t *";
-  platform_ = platform;
-}
-
-void CodeGenTileLangPTOAS::PrintFuncPrefix(std::ostream &os) {
-  //os << "extern \"C\" CATLASS_GLOBAL\n";
-}
-
-std::string CodeGenTileLangPTOAS::Finish() {
-  return super::Finish();
-}
-
-void CodeGenTileLangPTOAS::VisitStmt_(const tir::ForNode *op) {
-  auto flush = false;
-  if (flush_out_) {
-    flush = true;
-    flush_out_ = false;
-  }
-  if (op->kind == tir::ForKind::kUnrolled) {
-    PrintIndent();
-    stream << "#pragma unroll\n";
-  }
-  std::string extent =
-      PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
-  std::string vid = AllocVarID(op->loop_var.get());
-  std::string start = PrintExpr(op->min);
-  for_num_map_[vid] = extent;
-  stream << "\n  for (";
-  PrintType(op->loop_var.dtype(), stream);
-  stream << ' ' << vid << " = " << start << "; " << vid << " < " << extent
-         << "; ++" << vid << ") {\n";
-  int for_scope = BeginScope();
-  PrintStmt(op->body);
-  this->EndScope(for_scope);
-  PrintIndent();
-  stream << "}\n";
-  if (flush) {
-    while (!inst_.empty()) {
-      PrintIndent();
-      stream << inst_.back();
-      inst_.pop_back();
-    }
-  }
-}
-
-void CodeGenTileLangPTOAS::PrintType(DataType t,
-                                      std::ostream &os) { // NOLINT(*)
-  int lanes = t.lanes();
-  if (t.is_handle()) {
-    ICHECK(t.is_scalar()) << "do not yet support vector types";
-    os << "void*";
-    return;
-  }
-
-  if (t.is_void()) {
-    os << "void";
-    return;
-  }
-
-  bool fail = false;
-  if (t.is_float()) {
-    switch (t.bits()) {
-    case 16:
-      enable_fp16_ = true;
-      if (t.is_scalar()) {
-        os << "half_t";
-      } else if (lanes <= 8) {
-        // Emit CUDA code to access fp16 vector elements.
-        //
-        // half4 is stored as uint2
-        //
-        // h4.x is emitted as *(half2*)(&(u2.x)).x
-        // h4.y is emitted as *(half2*)(&(u2.x)).y
-        // h4.z is emitted as *(half2*)(&(u2.y)).x
-        // h4.w is emitted as *(half2*)(&(u2.y)).y
-        //
-        ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
-        os << "uint" << lanes / 2;
-      } else {
-        fail = true;
-      }
-      break;
-    case 32:
-      if (lanes <= 4) {
-        os << "float";
-      } else if (lanes <= 8) {
-        // Emit CUDA code to access fp32 vector elements for 4 < lanes <= 8.
-        //
-        // float8 is stored as ulonglong4
-        //
-        // f8.v1 is emitted as *(float2*)(&(ul4.x)).x
-        // f8.v2 is emitted as *(float2*)(&(ul4.x)).y
-        //
-        ICHECK_EQ(lanes % 2, 0)
-            << "only support even lane for float type with lanes > 4";
-        os << "ulonglong" << lanes / 2;
-      } else {
-        fail = true;
-      }
-      break;
-    case 64:
-      os << "double";
-      break;
-    default:
-      fail = true;
-      break;
-    }
-    if (!fail && (t.is_scalar() || t.bits() == 16))
-      return;
-    if (!fail && (lanes > 4 && lanes <= 8 && t.bits() == 32))
-      return;
-    if (!fail && (lanes >= 2 && lanes <= 4)) {
-      os << lanes;
-      return;
-    }
-  } else if (t.is_bfloat16()) {
-    enable_bf16_ = true;
-    if (t.is_scalar()) {
-      os << "bfloat16_t";
-    } else if (lanes <= 8) {
-      ICHECK_EQ(lanes % 2, 0) << "only support even lane for half type";
-      os << "uint" << lanes / 2;
-    } else {
-      fail = true;
-    }
-    if (!fail)
-      return;
-  } else if (t.is_float8()) {
-    // enable_fp8_ = true;
-    // os << GetFP8Type(t);
-    return;
-  } else if (t == DataType::Bool()) {
-    os << "bool";
-    return;
-  } else if (t.is_vector_bool()) {
-    // CUDA does not support bool vectors.
-    // Use ushort vectors to represent instead.
-    int n = t.lanes();
-    if (n <= 4) {
-      os << "ushort" << n;
-      return;
-    }
-  } else if (t.is_uint() || t.is_int()) {
-    if (t.is_uint()) {
-      os << "u";
-    }
-    switch (t.bits()) {
-    case 1: {
-      if (t.is_scalar()) {
-        os << "int";
-        return;
-      } else if (t.lanes() == 8) {
-        os << "int8_t";
-        return;
-      } else if (t.lanes() == 16) {
-        os << "int16_t";
-        return;
-      } else if (t.lanes() == 32) {
-        os << "int";
-        return;
-      } else {
-        LOG(FATAL) << "Cannot convert type " << t << " to CUDA type!";
-      }
-    }
-    case 4: {
-      if (t.is_scalar()) {
-        os << "int";
-        return;
-      } else if (t.lanes() == 4) {
-        os << "int16_t";
-        return;
-      } else if (t.lanes() == 8) {
-        // directly 8 4-bit int in integer.
-        os << "int";
-        return;
-      } else if (t.lanes() == 16) {
-        os << "int2";
-        return;
-      } else if (t.lanes() == 32) {
-        os << "int4";
-        return;
-      } else if (t.lanes() == 64) {
-        os << "int8";
-        return;
-      } else {
-        LOG(FATAL) << "Cannot convert type " << t << " to CUDA type!";
-      }
-    }
-    case 8: {
-      if (t.lanes() == 4) {
-        // directly 4 8 bit int in integer.
-        enable_int8_ = true;
-
-        // We use int for int8x4 instead of char4 because using char4 is
-        // likely to produce extra instructions to pack four int8 elements
-        // into 32-bit data.
-        os << "int";
-        return;
-      } else if (t.lanes() == 8) {
-        enable_int8_ = true;
-        os << "int2";
-        return;
-      } else if (t.lanes() == 16) {
-        enable_int8_ = true;
-        os << "int4";
-        return;
-      } else if (!t.is_uint() && t.is_scalar()) {
-        os << "signed char";
-        break;
-      } else {
-        os << "char";
-        break;
-      }
-    }
-    case 16: {
-      if (t.is_scalar()) {
-        os << "short";
-      } else if (t.lanes() <= 4) {
-        os << "short" << lanes;
-      } else if (t.lanes() <= 8) {
-        // Emit CUDA code to access int16 vector elements.
-        //
-        // short4 is stored as int2
-        //
-        // s4.x is emitted as *(short2*)(&(i2.x)).x
-        // s4.y is emitted as *(short2*)(&(i2.x)).y
-        // s4.z is emitted as *(short2*)(&(i2.y)).x
-        // s4.w is emitted as *(short2*)(&(i2.y)).y
-        //
-        ICHECK_EQ(t.lanes() % 2, 0)
-            << "only support even lane for shorT type with lanes > 4";
-        os << "int" << t.lanes() / 2;
-      } else {
-        fail = true;
-      }
-      if (!fail) {
-        return;
-      }
-      break;
-    }
-    case 32: {
-      if (t.is_scalar()) {
-        os << "int32_t";
-      } else if (t.lanes() <= 4) {
-        os << "int" << t.lanes();
-      } else if (t.lanes() <= 8) {
-        // Emit CUDA code to access int32 vector elements for 4 < lanes <= 8.
-        //
-        // int8 is stored as longlong4
-        //
-        // i8.v1 is emitted as *(int2*)(&(l4.x)).x
-        // i8.v2 is emitted as *(int2*)(&(l4.x)).y
-        //
-        ICHECK_EQ(lanes % 2, 0)
-            << "only support even lane for int32 type with lanes > 4";
-        os << "longlong" << lanes / 2;
-      } else {
-        fail = true;
-      }
-      if (!fail) {
-        return;
-      }
-      break;
-    }
-    case 64: {
-      if (t.is_scalar()) {
-        os << "int64_t";
-      } else if (t.lanes() == 2) {
-        os << "longlong2";
-      } else if (t.lanes() == 3) {
-        os << "longlong3";
-      } else if (t.lanes() == 4) {
-        os << "longlong4";
-      }
-      return;
-    }
-    default:
-      fail = true;
-      break;
-    }
-    if (!fail && lanes == 1) {
-      return;
-    }
-    if (!fail && (lanes >= 2 && lanes <= 4)) {
-      os << lanes;
-      return;
-    }
-  }
-  LOG(FATAL) << "Cannot convert type " << t << " to CUDA type";
-}
-
-void CodeGenTileLangPTOAS::PrintStorageScope(const std::string &scope,
-                                              std::ostream &os) { // NOLINT(*)
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const FloorDivNode *op,
-                                       std::ostream &os) {
-  os << "(";
-  PrintExpr(op->a, os);
-  os << " / ";
-  PrintExpr(op->b, os);
-  os << ")";
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const FloorModNode *op,
-                                       std::ostream &os) {
-  os << "(";
-  PrintExpr(op->a, os);
-  os << " % ";
-  PrintExpr(op->b, os);
-  os << ")";
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const BufferLoadNode *op,
-                                       std::ostream &os) {
-  auto var_name = var_idmap_[op->buffer->data.get()];
-  std::string scope = op->buffer.scope();
-  if (scope == "" || scope == "global") {
-    os << "*(" << var_name << "_handle + " << PrintExpr(op->indices.back()) << ")";
-  } else {
-    os << var_name << ".GetValue("
-                << PrintExpr(op->indices.back()) << ")";
-  }
-}
-
-void CodeGenTileLangPTOAS::VisitStmt_(const BufferStoreNode *op) {
-  auto var_name = var_idmap_[op->buffer->data.get()];
-  this->PrintIndent();
-  std::string scope = op->buffer.scope();
-
-  if (scope == "" || scope == "global") {
-    this->stream << "*(" << var_name << "_handle + "
-                 << PrintExpr(op->indices.back())
-                 << ") = " << PrintExpr(op->value) << ";\n";
-  } else {
-    this->stream << var_name << ".SetValue(" << PrintExpr(op->indices.back())
-                 << ", " << PrintExpr(op->value) << ");\n";
-  }
-}
-
-static std::map<std::string, std::string> extractTemplateParams(const std::string& input) {
-    std::map<std::string, std::string> result;
-    size_t start = input.find('<');
-    size_t end = input.rfind('>');
-
-    if (start == std::string::npos || end == std::string::npos || start >= end) {
-        return result;
-    }
-    std::string inner = input.substr(start + 1, end - start - 1);
-    std::vector<std::string> params;
-    std::stringstream ss(inner);
-    std::string param;
-    while (std::getline(ss, param, ',')) {
-        param.erase(0, param.find_first_not_of(" \t"));
-        param.erase(param.find_last_not_of(" \t") + 1);
-        params.push_back(param);
-    }
-    std::vector<std::string> paramNames = {
-        "data_type_input",
-        "data_type_output",
-        "M",
-        "N",
-        "K",
-        "transpose_A",
-        "transpose_B"
-    };
-    for (size_t i = 0; i < params.size() && i < paramNames.size(); ++i) {
-        result[paramNames[i]] = params[i];
-    }
-    for (size_t i = paramNames.size(); i < params.size(); ++i) {
-        result["extra_param_" + std::to_string(i - paramNames.size() + 1)] = params[i];
-    }
-    return result;
-}
-
-static std::vector<std::string> extractShapeFromTemplate(const std::string& input) {
-    std::vector<std::string> numbers;
-    size_t start = input.find('<');
-    if (start == std::string::npos) {
-        return numbers;
-    }
-    size_t end = input.find('>', start);
-    if (end == std::string::npos) {
-        return numbers;
-    }
-    std::string templatePart = input.substr(start + 1, end - start - 1);
-    templatePart.erase(std::remove(templatePart.begin(), templatePart.end(), ' '),
-                       templatePart.end());
-    std::vector<std::string> parts;
-    std::stringstream ss(templatePart);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        parts.push_back(token);
-    }
-    for (size_t i = 1; i < parts.size(); ++i) {
-        bool isNumber = !parts[i].empty() &&
-                       std::all_of(parts[i].begin(), parts[i].end(), ::isdigit);
-        if (isNumber) {
-            numbers.push_back(parts[i]);
-        }
-    }
-    return numbers;
-}
-
-static int GetValidShape(int shape, std::string& dtype) {
-  int dtype_len = GetTypeLen(dtype);
-  int shape_mod = shape  * GetTypeLen(dtype) % 32;
-  if (shape_mod == 0) {
-      return shape;
-  }
-  return shape + (32 - shape_mod) / dtype_len;
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const CallNode *op, std::ostream &os) {
-  if (op->op.same_as(builtin::call_extern())) {
-    CallExternCodegen(op);
-  } else if (op->op.same_as(tl::ascend_gemm_v0())) {
-    GemmV0Codegen(op);
-  } else if (op->op.same_as(tl::ascend_fill())) {
-    FillCodegen(op);
-  } else if (op->op.same_as(tl::ascend_exp())) {
-    UnaryVecOpCodegen(op, "TEXP");
-  } else if (op->op.same_as(tl::ascend_ln())) {
-    UnaryVecOpCodegen(op, "TLOG");
-  } else if (op->op.same_as(tl::ascend_abs())) {
-    UnaryVecOpCodegen(op, "TABS");
-  } else if (op->op.same_as(tl::ascend_reciprocal())) {
-    UnaryVecOpCodegen(op, "TRECIP");
-  } else if (op->op.same_as(tl::ascend_sqrt())) {
-    UnaryVecOpCodegen(op, "TSQRT");
-  } else if (op->op.same_as(tl::ascend_rsqrt())) {
-    UnaryVecOpCodegen(op, "TRSQRT");
-  } else if (op->op.same_as(tl::ascend_relu())) {
-    UnaryVecOpCodegen(op, "TRELU");
-  } else if (op->op.same_as(tl::ascend_bitwise_not())) {
-    UnaryVecOpCodegen(op, "TNOT");
-  } else if (op->op.same_as(tl::ascend_leaky_relu())) {
-    ScalarOpCodegen(op, "TLRELU");
-  } else if (op->op.same_as(tl::ascend_axpy())) {
-    ICHECK(false) << "axpy not support in pto. use muls and add instead";
-    ScalarOpCodegen(op, "T");
-  } else if (op->op.same_as(tl::ascend_reduce())) {
-    ReduceOpCodegen(op);
-  } else if (op->op.same_as(tl::ascend_add())) {
-    BinaryVecOpCodegen(op, "TADD");
-  } else if (op->op.same_as(tl::ascend_sub())) {
-    BinaryVecOpCodegen(op, "TSUB");
-  } else if (op->op.same_as(tl::ascend_mul())) {
-    BinaryVecOpCodegen(op, "TMUL");
-  } else if (op->op.same_as(tl::ascend_div())) {
-    BinaryVecOpCodegen(op, "TDIV");
-  } else if (op->op.same_as(tl::ascend_max())) {
-    BinaryVecOpCodegen(op, "TMAX");
-  } else if (op->op.same_as(tl::ascend_min())) {
-    BinaryVecOpCodegen(op, "TMIN");
-  } else if (op->op.same_as(tl::ascend_bitwise_and())) {
-    BinaryVecOpCodegen(op, "TAND");
-  } else if (op->op.same_as(tl::ascend_bitwise_or())) {
-    BinaryVecOpCodegen(op, "TOR");
-  } else if (op->op.same_as(tl::ascend_adds())) {
-    BinaryVecOpsCodegen(op, "TADDS");
-  } else if (op->op.same_as(tl::ascend_subs())) {
-    BinaryVecOpsCodegen(op, "TSUBS");
-  } else if (op->op.same_as(tl::ascend_muls())) {
-    BinaryVecOpsCodegen(op, "TMULS");
-  } else if (op->op.same_as(tl::ascend_divs())) {
-    BinaryVecOpsCodegen(op, "TDIVS");
-  }
-  // else if (op->op.same_as(tl::ascend_maxs())) {
-  //   BinaryVecOpsCodegen(op, "TMAXS");
-  // } else if (op->op.same_as(tl::ascend_mins())) {
-  //   BinaryVecOpsCodegen(op, "TMINS");
-  // }
-    else if (op->op.same_as(tl::ascend_pipe_barrier())) {
-    PipeBarrierCodegen(op);
-  } else if (op->op.same_as(tl::ascend_set_flag())) {
-    SetAndWaitFlagCodegen(op, "set_flag");
-  } else if (op->op.same_as(tl::ascend_wait_flag())) {
-    SetAndWaitFlagCodegen(op, "wait_flag");
-  } else if (op->op.same_as(tl::ascend_set_cross_flag())) {
-    SetCrossFlagCodegen(op);
-  } else if (op->op.same_as(tl::ascend_wait_cross_flag())) {
-    WaitCrossFlagCodegen(op);
-  } else if (op->op.same_as(tl::ascend_auto_set_flag())) {
-    AutoFlagOpCodegen(op, "set_flag");
-  } else if (op->op.same_as(tl::ascend_auto_wait_flag())) {
-    AutoFlagOpCodegen(op, "wait_flag");
-  } else if (op->op.same_as(tl::ascend_auto_set_cross_flag())) {
-    AutoSetCrossFlagCodegen(op);
-  } else if (op->op.same_as(tl::ascend_auto_wait_cross_flag())) {
-    WaitCrossFlagCodegen(op);
-  } else if (op->op.same_as(tl::ascend_auto_barrier())) {
-    AutoBarrierCodegen(op);
-  } else if (op->op.same_as(tl::ascend_clamp_max())) {
-    BinaryVecClampOpsCodegen(op, "TMINS");
-  } else if (op->op.same_as(tl::ascend_clamp_min())) {
-    BinaryVecClampOpsCodegen(op, "TMAXS");
-  } else if (op->op.same_as(tl::ascend_round())) {
-    CastCodegen(op, "RoundMode::CAST_ROUND");
-  } else if (op->op.same_as(tl::ascend_cast())) {
-    std::string cast_type = op->args[2].as<StringImmNode>()->value;
-    if (cast_type == "CAST_NONE") {
-      CastCodegen(op, "RoundMode::CAST_NONE");
-    } else if (cast_type == "CAST_RINT") {
-      CastCodegen(op, "RoundMode::CAST_RINT");
-    } else if (cast_type == "CAST_FLOOR") {
-      CastCodegen(op, "RoundMode::CAST_FLOOR");
-    } else if (cast_type == "CAST_CEIL") {
-      CastCodegen(op, "RoundMode::CAST_CEIL");
-    } else if (cast_type == "CAST_ROUND") {
-      CastCodegen(op, "RoundMode::CAST_ROUND");
-    } else if (cast_type == "CAST_TRUNC") {
-      CastCodegen(op, "RoundMode::CAST_TRUNC");
-    } else if (cast_type == "CAST_ODD") {
-      CastCodegen(op, "RoundMode::CAST_ODD");
-    } 
-  } else if (op->op.same_as(tl::ascend_createvecindex())) {
-    CreateVecIndexCodegen(op, "TCI");
-  } else if (op->op.same_as(tl::ascend_gatherb())) {
-    GatherbCodegen(op, "TGATHERB");
-  } else if (op->op.same_as(tl::ascend_pow())) {
-    PowCodegen(op);
-  } else if (op->op.same_as(tl::ascend_sort32())) {
-    Sort32Codegen(op, "TSORT32");
-  } else if (op->op.same_as(tl::ascend_transpose())) {
-    TransposeCodegen(op, "TTRANS");
-  } else if (op->op.same_as(tl::ascend_bitwise_xor())) {
-    XorCodegen(op, "TXOR");
-  } else if (op->op.same_as(tl::ascend_compare())) {
-    CompareCodegen(op, "TCMP");
-  } else if (op->op.same_as(tl::ascend_compare_scalar())) {
-    CompareScalarCodegen(op, "TCMPS");
-  }
-}
-
-std::string CodeGenTileLangPTOAS::PrintBufferOffset(const CallNode *op) {
-    auto _var = op->args[1].as<VarNode>();
-    std::string _var_name = var_idmap_[_var];
-    return _var_name;
-}
-
-void CodeGenTileLangPTOAS::CallExternCodegen(const CallNode *op) {
-  std::string op_name = Downcast<StringImm>(op->args[0])->value;
-  if (op_name.find("tl::ascend::copy") != std::string::npos) {
-    auto src_var = op->args[1].as<CallNode>()->args[1].as<VarNode>();
-    auto dst_var = op->args[2].as<CallNode>()->args[1].as<VarNode>();
-
-    auto src_var_id = var_idmap_[src_var];
-    auto dst_var_id = var_idmap_[dst_var];
-    if (src_var_id == "") {
-      src_var_id = src_var->name_hint;
-    }
-    if (dst_var_id == "") {
-      dst_var_id = dst_var->name_hint;
-    }
-
-    auto src_offset = PrintExpr(op->args[1].as<CallNode>()->args[2]);
-    auto dst_offset = PrintExpr(op->args[2].as<CallNode>()->args[2]);
-
-    auto src_shape = PrintExpr(op->args[1].as<CallNode>()->args[3]);
-    auto dst_shape = PrintExpr(op->args[2].as<CallNode>()->args[3]);
-
-    auto src_type = op->args[1].as<CallNode>()->args[0].as<CallNode>()->dtype;
-    auto dst_type = op->args[2].as<CallNode>()->args[0].as<CallNode>()->dtype;
-
-    static const std::unordered_map<std::string, int> kCopyOpExtraArgs = {
-      {"copy_l0c_to_gm", 1},
-      {"copy_gm_to_l1", 1},
-      {"copy_l1_to_l0a", 3},
-      {"copy_l1_to_l0b", 3},
-      {"copy_gm_to_ub", 1},
-      {"copy_ub_to_gm", 1},
-      {"copy_ub_to_ub", 0}
-    };
-
-    std::unordered_map<std::string, std::string>
-      ptoCopyMap = {
-      {"copy_l0c_to_gm", "TSTORE"},
-      {"copy_gm_to_l1", "TLOAD"},
-      {"copy_l1_to_l0a", "TEXTRACT"},
-      {"copy_l1_to_l0b", "TEXTRACT"},
-      {"copy_gm_to_ub", "TLOAD"},
-      {"copy_ub_to_gm", "TSTORE"},
-      {"copy_ub_to_ub", "TCVT"}
-    };
-
-    bool found = false;
-    int extra_args = 0;
-    std::string real_name = "";
-
-    for (const auto& pair : kCopyOpExtraArgs) {
-      if (op_name.find(pair.first) != std::string::npos) {
-        real_name = pair.first;
-        found = true;
-        extra_args = pair.second;
-        break;
-      }
-    }
-
-    if (found) {
-      auto api_name = ptoCopyMap[real_name];
-      PrimExpr row_index;
-      PrimExpr col_index;
-      if (api_name == "TCVT") {
-        api_name = src_type == dst_type ? "TMOV":"TCVT";
-      } else if (api_name == "TEXTRACT") {
-        if (op->args.size() >= 3 && op->args[5].as<IntImmNode>()->value != 0) {
-            row_index = op->args[4];
-            col_index = op->args[3];
-        } else {
-            api_name = "TCVT";
-        }
-      }
-      if (api_name == "TEXTRACT") {
-        this->PrintIndent();
-        this->stream << api_name << "(" << dst_var_id << ", "
-        << src_var_id << ", " << row_index << ", " << col_index << ");\n";
-      } else if (api_name == "TCVT") {
-        this->PrintIndent();
-        this->stream << api_name << "(" << dst_var_id << ", "
-        << src_var_id << ", pto::RoundMode::CAST_NONE" << ");\n";
-      } else if (api_name == "TMOV") {
-        this->PrintIndent();
-        std::vector src_ub_data = ub_data_map_[src_var_id];
-        std::vector dst_ub_data = ub_data_map_[dst_var_id];
-        int32_t len = GetTypeLen(src_ub_data[0]);
-        std::vector shapes = extractShapeFromTemplate(op_name);
-        if (shapes.size() == 1 && (src_offset != dst_offset || src_shape != dst_shape || src_offset != "0" || dst_offset != "0")) {
-          this->stream << kAscendPtoScope << "mov_tile<" << src_ub_data[0] << ", " << std::stoi(shapes[0]) << ">("
-          << src_ub_data[3] << ", " << dst_ub_data[3]
-          << ", " << src_offset << ", " << dst_offset << ", " << len << ");\n";
-        } else {
-          this->stream << api_name << "(" << dst_var_id << ", " << src_var_id << ");\n";
-        }
-      }
-      if (api_name == "TLOAD") {
-        ICHECK((copy_base_addr_map_.find(String(src_var_id)) != copy_base_addr_map_.end()));
-        std::vector<std::string> l_valid_shapes = l_data_map_[dst_var_id];
-        std::vector<std::string> ub_valid_shapes = ub_data_map_[dst_var_id];
-        std::vector<std::string> dynamic_names;
-        std::string tensor_addr = copy_base_addr_map_[String(src_var_id)];
-        std::string tensor_template = "<" + global_tensor_template[String(tensor_addr)].dtype;
-        std::string shape_template = "", stride_template = "", valid_template = "";
-        size_t len = global_tensor_template[String(tensor_addr)].shape_list.size();
-        size_t shape_len = 2;
-        size_t op_arg_len = op->args.size();
-        size_t shape_size = 5;
-        // Dynamic Shape and Static Shape
-
-        // generate shape
-        std::vector<std::string> shape_nums(shape_len);
-        shape_nums[1] =  PrintExpr(op->args[op_arg_len - 1]);
-        if (op_arg_len == 5) {
-            shape_nums[0] =  "1";
-        } else {
-            shape_nums[0] =  PrintExpr(op->args[op_arg_len - 2]);
-        }
-        for (size_t i = 0; i < shape_size; i++) {
-            if (i < shape_size - shape_len) {
-              shape_template += "1";
-            } else {
-              shape_template += shape_nums[i + shape_len - shape_size];
-            }
-            if (i < shape_size - 1) {
-              shape_template += ", ";
-            }
-        }
-        // shape_template += ">";
-        // generate stride
-        for (size_t i = 0; i < 4; i++) {
-          if (len > 3 - i) {
-            std::string tensor_template = global_tensor_template[String(tensor_addr)].shape_list[len + i - 4];
-            if (tensor_template[0] < '1' || tensor_template[0] > '9')  {
-              stride_template += "-1, ";
-              dynamic_names.push_back(tensor_template);
-            }
-            else {
-              std::string tmp_shape = "";
-              for(size_t j = 0; j < 4 - i; j++) {
-                tmp_shape += global_tensor_template[String(tensor_addr)].shape_list[len - j - 1];
-                if (j < 3 - i) tmp_shape += " * ";
-              }
-              stride_template = stride_template +  tmp_shape + ", ";
-            }
-          } else {
-            stride_template += "1, ";
-          }
-        }
-        stride_template += "1";
-        // get gm2l1 shape
-
-        bool is_dynamic = global_tensor_template[String(tensor_addr)].shape_type=="dynamic";
-        std::string src_var = "";
-        if(op_name.find("copy_gm_to_l1") != std::string::npos) {
-          src_var = "copy_gm_to_l1";
-          if (is_dynamic) {
-            src_var = src_var + "_dynamic";
-          }
-          tensor_template = tensor_template + ", " + l_valid_shapes[0] + ", ";
-          valid_template = l_valid_shapes[1] + ", " + l_valid_shapes[2];
-        } else if(op_name.find("copy_gm_to_ub") != std::string::npos) {
-          src_var = "copy_gm_to_ub";
-          if (is_dynamic) {
-            src_var = src_var + "_dynamic";
-          }
-          tensor_template = tensor_template + ", " + ub_valid_shapes[0] + ", ";
-          valid_template = ub_valid_shapes[1] + ", " + ub_valid_shapes[2];
-        }
-        tensor_template = tensor_template + shape_template + ", " + stride_template + ", " + valid_template + ">";
-        this->PrintIndent();
-        this->stream << kAscendPtoScope << src_var << tensor_template << "(" << tensor_addr << " + " << src_offset;
-        if(is_dynamic) {
-          std::string shape = "pto::Shape<"  + shape_template + ">()";
-          this->stream << ", " << "pto::Shape<"  << shape_template << ">" << "(), " << "pto::Stride<" << stride_template << ">" << "(";
-          for(size_t i = 0; i < dynamic_names.size(); i++) {
-            this->stream << dynamic_names[i];
-            if (i != dynamic_names.size() - 1) {
-              this->stream << ", ";
-            }
-          }
-          this->stream << ")";
-        }
-        if (api_name == "TLOAD" && prefetch_n_stages_map_.count(dst_var_id) && prefetch_n_stages_map_[dst_var_id].first > 0) {
-
-		  auto buffer_k = op->args[2].as<CallNode>()->args[2] / op->args[2].as<CallNode>()->args[3];
-          tvm::arith::Analyzer analyzer;
-          PrimExpr simplified_k = analyzer.Simplify(buffer_k);
-		  this->stream << ", " << dst_var_id << "[" << simplified_k << "]" << ");\n";
-
-          prefetch_n_stages_map_[dst_var_id].second++;
-        } else {
-          this->stream << ", " << dst_var_id << ");\n";
-        }
-
-      } else if (api_name == "TSTORE") {
-        ICHECK((copy_base_addr_map_.find(String(dst_var_id)) != copy_base_addr_map_.end()));
-        std::vector<std::string> l_valid_shapes = l_data_map_[src_var_id];
-        std::vector<std::string> ub_valid_shapes = ub_data_map_[src_var_id];
-        std::vector<std::string> dynamic_names;
-        std::string tensor_addr = copy_base_addr_map_[String(dst_var_id)];
-        std::string tensor_template = "<" + global_tensor_template[String(tensor_addr)].dtype;
-        std::string shape_template = "", stride_template = "", valid_template = "";
-        size_t len = global_tensor_template[String(tensor_addr)].shape_list.size();
-        size_t shape_len = 2;
-        size_t op_arg_len = op->args.size();
-        size_t shape_size = 5;
-        // Dynamic Shape and Static Shape
-
-        // generate shape
-        std::vector shape_tile = extractShapeFromTemplate(op_name);
-        std::vector<std::string> shape_nums(shape_len);
-        bool is_chunking = false;
-
-        if (shape_tile[0] != PrintExpr(op->args[op_arg_len - 1]) && op_name.find("copy_ub_to_gm") != std::string::npos) {
-          ub_valid_shapes[2] = shape_tile[0];
-          is_chunking = true;
-        }
-        shape_nums[1] =  PrintExpr(op->args[op_arg_len - 1]);
-        if (op_arg_len == 5) {
-          shape_nums[0] =  "1";
-        } else if(shape_tile[1] != PrintExpr(op->args[op_arg_len - 2]) && op_name.find("copy_ub_to_gm") != std::string::npos) { //
-          is_chunking = true;
-          ub_valid_shapes[1] = shape_tile[1];
-          shape_nums[0] = PrintExpr(op->args[op_arg_len - 2]);
-        } else {
-          shape_nums[0] = PrintExpr(op->args[op_arg_len - 2]);
-        }
-        for (size_t i = 0; i < shape_size; i++) {
-            if (i < shape_size - shape_len) {
-                shape_template += "1";
-            } else {
-                if (is_chunking) {
-                  shape_template += ub_valid_shapes[i + shape_len - shape_size + 1];
-                } else {
-                  shape_template += shape_nums[i + shape_len - shape_size];
-                }
-            }
-            if (i < shape_size - 1) {
-                shape_template += ", ";
-            }
-        }
-
-        for (size_t i = 0; i < 4; i++) {
-          if (len > 3 - i) {
-            std::string tensor_template = global_tensor_template[String(tensor_addr)].shape_list[len + i - 4];
-            if (tensor_template[0] < '1' || tensor_template[0] > '9')  {
-              stride_template += "-1, ";
-              dynamic_names.push_back(tensor_template);
-            }
-            else {
-              std::string tmp_shape = "";
-              for(size_t j = 0; j < 4 - i; j++) {
-                tmp_shape += global_tensor_template[String(tensor_addr)].shape_list[len - j - 1];
-                if (j < 3 - i) tmp_shape += " * ";
-              }
-              stride_template = stride_template +  tmp_shape + ", ";
-            }
-          } else {
-            stride_template += "1, ";
-          }
-        }
-        stride_template += "1";
-
-        // get gm2l1 shape
-        bool is_dynamic = global_tensor_template[String(tensor_addr)].shape_type=="dynamic";
-        std::string src_var = "";
-        if(op_name.find("copy_l0c_to_gm") != std::string::npos) {
-          src_var = "copy_l0c_to_gm";
-          if (is_dynamic) {
-            src_var = src_var + "_dynamic";
-          }
-          tensor_template = tensor_template + ", " + l_valid_shapes[0] + ", ";
-          valid_template = l_valid_shapes[1] + ", " + l_valid_shapes[2];
-        } else if(op_name.find("copy_ub_to_gm") != std::string::npos) {
-          src_var = "copy_ub_to_gm";
-          if (is_dynamic) {
-            src_var = src_var + "_dynamic";
-          }
-          tensor_template = tensor_template + ", " + ub_valid_shapes[0] + ", ";
-          valid_template = "";
-        }
-        // tensor_template = tensor_template + shape_template + ", " + stride_template + ", " + valid_template;
-        if (op_name.find("copy_ub_to_gm") != std::string::npos) {
-          tensor_template = tensor_template + shape_template + ", " + stride_template  + ", " +
-          shape_nums[0] + ", " + shape_nums[1] + ", " + ub_valid_shapes[1] + ", " + ub_valid_shapes[2] + ">";
-        } else {
-          tensor_template = tensor_template + shape_template + ", " + stride_template + ", " + valid_template + ">";
-        }
-        this->PrintIndent();
-        this->stream << kAscendPtoScope << src_var << tensor_template << "(" << tensor_addr << " + " << dst_offset;
-        if(is_dynamic) {
-          this->stream << ", " << "pto::Shape<"  << shape_template << ">" << "(), " << "pto::Stride<" << stride_template << ">" << "(";
-          for(size_t i = 0; i < dynamic_names.size(); i++) {
-             this->stream << dynamic_names[i];
-            if (i != dynamic_names.size() - 1) {
-              this->stream << ", ";
-            }
-          }
-          this->stream << ")";
-        }
-        if (op_name.find("copy_ub_to_gm") != std::string::npos) {
-          int32_t type_len = GetTypeLen(global_tensor_template[String(tensor_addr)].dtype);
-          this->stream << ", " << ub_valid_shapes[3] << ", " << src_offset << "," << type_len << ");\n";
-        } else {
-          this->stream << ", " << src_var_id << ");\n";
-        }
-      }
-    } else {
-      this->PrintIndent();
-      this->stream << "not implemented yet\n";
-    }
-  }
-}
-
-void CodeGenTileLangPTOAS::GemmV0Codegen(const CallNode *op) {
-  std::string op_name = Downcast<StringImm>(op->args[0])->value;
-  this->PrintIndent();
-  auto a_var = op->args[1].as<CallNode>()->args[1].as<VarNode>();
-  auto b_var = op->args[2].as<CallNode>()->args[1].as<VarNode>();
-  auto c_var = op->args[3].as<CallNode>()->args[1].as<VarNode>();
-
-  auto a_offset = PrintExpr(op->args[1].as<CallNode>()->args[2]);
-  auto b_offset = PrintExpr(op->args[2].as<CallNode>()->args[2]);
-  auto c_offset = PrintExpr(op->args[3].as<CallNode>()->args[2]);
-
-  auto a_name = var_idmap_[a_var];
-  auto b_name = var_idmap_[b_var];
-  auto c_name = var_idmap_[c_var];
-
-  if (prefetch_n_stages_map_[a_name].first > 0) {
-    auto a_k = op->args[1].as<CallNode>()->args[2] / op->args[1].as<CallNode>()->args[3];
-    tvm::arith::Analyzer analyzer;
-    PrimExpr simplified_a_k = analyzer.Simplify(a_k);
-    auto b_k = op->args[2].as<CallNode>()->args[2] / op->args[2].as<CallNode>()->args[3];
-    PrimExpr simplified_b_k = analyzer.Simplify(b_k);
-
-    std::map<std::string, std::string> params = extractTemplateParams(op_name);
-    std::string data_type_input = params["data_type_input"];
-    this->stream << kAscendPtoScope << "gemm_v0" << "<" <<  params["data_type_input"] << ", " << params["data_type_output"] << ", "
-    << GetValidShape(std::stoi(params["M"]), data_type_input) << ", "
-    << GetValidShape(std::stoi(params["N"]), data_type_input) << ", "
-    << GetValidShape(std::stoi(params["K"]), data_type_input) << ", "
-    << params["M"] << ", " << params["N"] << ", " << params["K"] << ", "
-    << params["transpose_A"] << ", " << params["transpose_B"] << ">"
-    << "(" << a_name << "[" << simplified_a_k << "], " << b_name << "[" << simplified_a_k << "], " << c_name << ", " << PrintExpr(op->args[4]) << ");\n";
-  } else {
-    std::map<std::string, std::string> params = extractTemplateParams(op_name);
-    std::string data_type_input = params["data_type_input"];
-    this->stream << kAscendPtoScope << "gemm_v0" << "<" <<  params["data_type_input"] << ", " << params["data_type_output"] << ", "
-    << GetValidShape(std::stoi(params["M"]), data_type_input) << ", "
-    << GetValidShape(std::stoi(params["N"]), data_type_input) << ", "
-    << GetValidShape(std::stoi(params["K"]), data_type_input) << ", "
-    << params["M"] << ", " << params["N"] << ", " << params["K"] << ", "
-    << params["transpose_A"] << ", " << params["transpose_B"] << ">"
-    << "(" << a_name << ", " << b_name << ", " << c_name << ", " << PrintExpr(op->args[4]) << ");\n";
-  }
-
-}
-
-void CodeGenTileLangPTOAS::PipeBarrierCodegen(const CallNode *op) {
-  std::string pipe = Downcast<StringImm>(op->args[0])->value;
-  this->PrintIndent();
-  this->stream << "pipe_barrier(PIPE_" << pipe << ");\n";
-}
-
-void CodeGenTileLangPTOAS::SetAndWaitFlagCodegen(const CallNode *op, const std::string &op_name) {
-  std::string src = Downcast<StringImm>(op->args[0])->value;
-  std::string dst = Downcast<StringImm>(op->args[1])->value;
-  std::string event_id = PrintExpr(op->args[2]);
-  this->PrintIndent();
-  this->stream << op_name << "(PIPE_" << src << ", " << "PIPE_" <<
-  dst << ", " << "EVENT_ID" << event_id << ");\n";
-}
-
-void CodeGenTileLangPTOAS::HandleA5Flag(const std::string &op,
-                                            const std::string &pipe, int flag) {
-  if (this->current_resource_scope_ == "CUBE") {
-    this->PrintIndent();
-    this->stream << op << "(" << "PIPE_" << pipe << ", " << flag << ");\n";
-    this->PrintIndent();
-    this->stream << op << "(" << "PIPE_" << pipe << ", " << flag + 16 << ");\n";
-  } else if (this->current_resource_scope_ == "VEC") {
-    this->PrintIndent();
-    this->stream << op << "(" << "PIPE_" << pipe << ", " << flag << ");\n";
-  } else {
-    LOG(WARNING) << op << " called outside of known scope (CUBE/VEC)!";
-  }
-}
-
-void CodeGenTileLangPTOAS::SetCrossFlagCodegen(const CallNode *op) {
-  std::string pipe = Downcast<StringImm>(op->args[0])->value;
-  int flag = std::stoi(PrintExpr(op->args[1]));
-
-  if (this->platform_ == "A5") {
-    HandleA5Flag("set_intra_block", pipe, flag);
-  } else {
-    int mode = 2;
-    int config = 1 | (mode << 4) | (flag << 8);
-    this->PrintIndent();
-    this->stream << "ffts_cross_core_sync" << "(" << "PIPE_" << pipe << ", "
-                 << config << ");\n";
-  }
-}
-
-void CodeGenTileLangPTOAS::AutoSetCrossFlagCodegen(const CallNode *op) {
-  auto pipe = op->args[1].as<StringImmNode>()->value;
-  auto flag = op->args[2].as<IntImmNode>()->value;
-  if (this->platform_ == "A5") {
-    HandleA5Flag("set_intra_block", pipe, flag);
-  } else {
-    auto mode = op->args[0].as<IntImmNode>()->value;
-    int config = 1 | (mode << 4) | (flag << 8);
-    this->PrintIndent();
-    this->stream << "ffts_cross_core_sync" << "(" << "PIPE_" << pipe << ", "
-                 << config << ");\n";
-  }
-}
-
-void CodeGenTileLangPTOAS::WaitCrossFlagCodegen(const CallNode *op) {
-  auto flag = op->args[0].as<IntImmNode>()->value;
-  auto pipe = op->args[1].as<StringImmNode>()->value;
-
-  if (this->platform_ == "A5") {
-    if (pipe.empty()) {
-      if (this->current_resource_scope_ == "CUBE") {
-        pipe = "MTE1";
-      } else if (this->current_resource_scope_ == "VEC") {
-        pipe = "V";
-      } else {
-        LOG(WARNING) << "Cannot infer default pipe for wait_intra_block in unknown scope";
-      }
-    }
-  } else {
-    if (!pipe.empty()) {
-      LOG(FATAL) << "Pipe argument for wait_cross_flag is only supported on A5 architecture.";
-    }
-  }
-
-  if (this->platform_ == "A5") {
-    HandleA5Flag("wait_intra_block", pipe, flag);
-  } else {
-    this->PrintIndent();
-    this->stream << "wait_flag_dev" << "(" << flag << ");\n";
-  }
-}
-
-void CodeGenTileLangPTOAS::FillCodegen(const CallNode *op) {
-  this->PrintIndent();
-  this->stream << "TEXPANDS" << "(" << PrintBufferOffset(op->args[1].as<CallNode>()) << ", "
-              << PrintExpr(op->args[2]) << ");\n";
-}
-
-void CodeGenTileLangPTOAS::CreateVecIndexCodegen(const CallNode *op,
-                                                  const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string dst_offset = PrintExpr(op->args[0].as<CallNode>()->args[2]);
-  std::string first_value = PrintExpr(op->args[1]);
-  std::vector<std::string> ub_data = ub_data_map_[dst_name];
-  int32_t len = GetTypeLen(ub_data[0]);
-  this->stream << kAscendPtoScope << "tci" << "<" << ub_data[0] << ", " << ub_data[1] << ", " 
-  << ub_data[2] << ">" << "(" << ub_data[3] << ", " << dst_offset << ", " << len << ", " << first_value << ");\n";
-}
-
-void CodeGenTileLangPTOAS::GatherbCodegen(const CallNode *op,
-                                                  const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  std::string idx_name = PrintExpr(op->args[3].as<CallNode>()->args[1]);
-  this->stream << op_name << "(" << dst_name << ", " << src_name << ", " << idx_name << ");\n";
-}
-
-void CodeGenTileLangPTOAS::PowCodegen(const CallNode *op) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src0_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src1_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  std::vector<std::string> ub_data = ub_data_map_[dst_name];
-  this->stream << kAscendPtoScope << "pow" << "<" << ub_data[0] << ", " << ub_data[1] << ", " << ub_data[2] << ">"
-   << "(" << dst_name << ", " << src0_name << ", " << src1_name << ");\n";
-}
-
-void CodeGenTileLangPTOAS::Sort32Codegen(const CallNode *op, const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string idx_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  this->stream << op_name << "(" << dst_name << ", " << src_name << ", " << idx_name << ");\n";
-}
-
-void CodeGenTileLangPTOAS::TransposeCodegen(const CallNode *op, const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  this->stream << op_name << "(" << dst_name << ", " << src_name << ", " << src_name << ");\n";
-}
-
-void CodeGenTileLangPTOAS::XorCodegen(const CallNode *op, const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src0_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src1_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  this->stream << op_name << "(" << dst_name << ", " << src0_name << ", " << src1_name << ", " << src1_name << ");\n";
-}
-
-void CodeGenTileLangPTOAS::CompareCodegen(const CallNode *op, const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src0_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src1_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  std::string mode = Downcast<StringImm>(op->args[3])->value;
-  this->stream << op_name << "(" << dst_name << ", " << src0_name << ", " << 
-  src1_name << ", " << "CmpMode::" << mode << ");\n";
-}
-
-void CodeGenTileLangPTOAS::CompareScalarCodegen(const CallNode *op, const std::string &op_name) {
-  this->PrintIndent();
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-  std::string src0_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src1_name = PrintExpr(op->args[2]);
-  std::string mode = Downcast<StringImm>(op->args[3])->value;
-  this->stream << op_name << "(" << dst_name << ", " << src0_name << ", " << 
-  src1_name << ", " << "CmpMode::" << mode << ");\n";
-}
-
-void CodeGenTileLangPTOAS::BinaryVecOpCodegen(const CallNode *op,
-                                               const std::string &op_name) {
-  std::vector<std::string> var_names;
-  std::string src0_name = PrintExpr(op->args[1].as<CallNode>()->args[1]);
-  std::string src1_name = PrintExpr(op->args[2].as<CallNode>()->args[1]);
-  std::string dst_name = PrintExpr(op->args[0].as<CallNode>()->args[1]);
-
-  std::string src0_offset = PrintExpr(op->args[1].as<CallNode>()->args[2]);
-  std::string src1_offset = PrintExpr(op->args[2].as<CallNode>()->args[2]);
-  std::string dst_offset = PrintExpr(op->args[0].as<CallNode>()->args[2]);
-
-  std::string src0_addr = ub_data_map_[src0_name][3];
-  std::string src1_addr = ub_data_map_[src1_name][3];
-  std::string dst_addr = ub_data_map_[dst_name][3];
-
-  std::string shape = PrintExpr(op->args[3]);
-
-  std::string ub_type = ub_data_map_[dst_name][0];
-  int32_t type_len = GetTypeLen(ub_type);
-  for (int i = 0; i < op->args.size() - 1; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  if (prefetch_n_stages_map_[var_names[1]].first > 0) {
-    auto buffer_k = op->args[1].as<CallNode>()->args[2] / op->args[1].as<CallNode>()->args[3];
-    tvm::arith::Analyzer analyzer;
-    PrimExpr simplified_buffer_k = analyzer.Simplify(buffer_k);
-    this->PrintIndent();
-    this->stream << op_name << "(";
-    for (int i = 0; i < var_names.size(); i++) {
-      this->stream << var_names[i];
-      if (i != 0) {
-        this->stream << "[" << simplified_buffer_k << "]";
-      }
-      if (i != var_names.size() - 1) {
-        this->stream << ", ";
-      }
-    }
-    this->stream << ");\n";
-  } else if (src0_offset != "0" || src1_offset != "0" || dst_offset != "0") {
-    this->PrintIndent();
-    this->stream << kAscendPtoScope << "binary_tile" << "<" << kAscendPtoScope << "BinaryOp::" << op_name << ", " << ub_type << ", " << shape << ">" << "("
-    << dst_addr << ", " << src0_addr << ", " << src1_addr << ", " << dst_offset
-    << ", " << src0_offset << ", " << src1_offset << ", " << type_len << ");\n";
-  } else if (prefetch_n_stages_map_[var_names[1]].first == 0) {
-    this->PrintIndent();
-    this->stream << op_name << "(";
-    for (int i = 0; i < var_names.size(); i++) {
-      this->stream << var_names[i];
-      if (i != var_names.size() - 1) {
-        this->stream << ", ";
-      }
-    }
-    this->stream << ");\n";
-  } else {
-    ICHECK(false) << "BinaryVecOpCodegen Failed";
-  }
-}
-
-static std::string findValueIfKeyContains(const std::map<std::string, std::string>& myMap, 
-                                   const std::string& inputKey) {
-    auto it = std::find_if(myMap.begin(), myMap.end(),
-        [&inputKey](const auto& pair) {
-            return inputKey.find(pair.first) != std::string::npos;
-        });
-    if (it != myMap.end()) {
-        return it->second;
-    }
-    return "";
-}
-
-static std::string getValueOrProcess(const std::map<std::string, std::string>& myMap,
-                             const std::string& key) {
-    auto it = myMap.find(key);
-    if (it != myMap.end()) {
-        return it->second;
-    } else {
-        return findValueIfKeyContains(myMap, key);
-    }
-}
-
-void CodeGenTileLangPTOAS::BinaryVecOpsCodegen(const CallNode *op,
-                                               const std::string &op_name) {
-  std::vector<std::string> var_names;
-  std::string operation = op_name;
-  for (int i = 0; i < op->args.size() - 2; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  if (op->args[2].as<CallNode>()) {
-    auto var_name = PrintBufferOffset(op->args[2].as<CallNode>());
-    std::string ub_name = var_names[1];
-    this->PrintIndent();
-    std::string index = PrintExpr(op->args[op->args.size() - 2]);
-    std::string offset = PrintExpr(op->args[0].as<CallNode>()->args[2]);
-    std::string scalar_name = var_name + "_scalar";
-    this->stream << "pipe_barrier(PIPE_ALL);\n";
-    this->stream << "auto " << scalar_name <<  "= " << var_name
-                << ".GetValue(" << index
-                << ");\n";
-    this->stream << "pipe_barrier(PIPE_ALL);\n";
-    std::vector<std::string> ub_data_vector = ub_data_map_[ub_name];
-    std::string var_name_temp = ub_name + "_temp";
-    std::string ub_data_type = ub_data_vector[0];
-    this->PrintIndent();
-    std::string loop_num = getValueOrProcess(for_num_map_, index);
-    int32_t ub_data_temp_col = std::stoi(ub_data_vector[2]) * std::stoi(ub_data_vector[1]) / std::stoi(loop_num);
-    this->stream << kAscendPtoScope << "TileUbDataND<" << ub_data_vector[0] << ", 1, "
-    << ub_data_temp_col << ", 1, " << ub_data_temp_col << "> " << var_name_temp << ";\n";
-    this->PrintIndent();
-    this->stream << "TASSIGN(" << var_name_temp << ", " << ub_data_vector[3] << " + " <<
-    offset << " * " << GetTypeLenString(ub_data_vector[0]) << ");\n";
-    this->PrintIndent();
-    this->stream << "pipe_barrier(PIPE_ALL);\n";
-    this->PrintIndent();
-    if (operation == "TSUBS") {
-      operation = "TADDS";
-      scalar_name = "-" + scalar_name;
-    }
-    this->stream << operation << "(";
-    this->stream << var_name_temp << ", " << var_name_temp << ", " << scalar_name;
-  } else {
-    this->PrintIndent();
-    this->stream << operation << "(";
-    std::string scalar = PrintExpr(op->args[op->args.size() - 2]);
-    var_names.push_back(operation == "TSUBS" ? ("-" + scalar):scalar);
-    for (int i = 0; i < var_names.size(); i++) {
-      this->stream << var_names[i];
-      if (i != var_names.size() - 1) {
-        this->stream << ", ";
-      }
-    }
-  }
-  this->stream << ");\n";
-}
-
-void CodeGenTileLangPTOAS::UnaryVecOpCodegen(const CallNode *op, const std::string& op_name) {
-  std::vector<std::string> var_names;
-  for (int i = 0; i < op->args.size() - 1; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  this->PrintIndent();
-  this->stream << op_name << "(";
-  for (int i = 0; i < var_names.size(); i++) {
-    this->stream << var_names[i];
-    if (i != var_names.size() - 1) {
-      this->stream << ", ";
-    }
-  }
-  this->stream << ");\n";
-}
-
-void CodeGenTileLangPTOAS::ScalarOpCodegen(const CallNode *op, const std::string& op_name) {
-    this->PrintIndent();
-    this->stream << op_name << "(" << PrintBufferOffset(op->args[0].as<CallNode>()) << ", "
-                  << PrintBufferOffset(op->args[1].as<CallNode>()) << ", "
-                  << PrintExpr(op->args[2]) << ");\n";
-}
-
-void CodeGenTileLangPTOAS::BinaryVecClampOpsCodegen(
-    const CallNode *op, const std::string &op_name) {
-  std::vector<std::string> var_names;
-  std::string operation = op_name;
-  for (int i = 1; i < op->args.size() - 3; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  if (op->args[4].as<CallNode>()) {
-    auto var_name = PrintBufferOffset(op->args[4].as<CallNode>());
-    std::string ub_name_dst = var_names[1];
-    std::string ub_name_src = var_names[2];
-    this->PrintIndent();
-    std::string index = PrintExpr(op->args[op->args.size() - 2]);
-    std::string scalar_name = var_name + "_scalar";
-    // this->stream << "pipe_barrier(PIPE_ALL);\n";
-    this->stream << "auto " << scalar_name << "= " << var_name << ".GetValue("
-                 << index << ");\n";
-    this->stream << "pipe_barrier(PIPE_ALL);\n";
-    this->stream << operation << "(";
-    this->stream << ub_name_dst << ", " << ub_name_src << ", " << scalar_name;
-  } else {
-    this->PrintIndent();
-    this->stream << operation << "(";
-    std::string scalar = PrintExpr(op->args[op->args.size() - 2]);
-    var_names.push_back(scalar);
-    for (int i = 0; i < var_names.size(); i++) {
-      this->stream << var_names[i];
-      if (i != var_names.size() - 1) {
-        this->stream << ", ";
-      }
-    }
-  }
-  this->stream << ");\n";
-}
-
-void CodeGenTileLangPTOAS::CastCodegen(const CallNode *op, const std::string& op_type) {
-  std::vector<std::string> var_names;
-  for (int i = 0; i < op->args.size() - 2; i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  this->PrintIndent();
-  this->stream << "TCVT" << "(";
-  var_names.push_back(op_type);
-  for (int i = 0; i < var_names.size(); i++) {
-    this->stream << var_names[i];
-    if (i != var_names.size() - 1) {
-      this->stream << ", ";
-    }
-  }
-  this->stream << ");\n";
 }
 
 static std::tuple<int, int, int, bool> ExtractTemplateParamsForSliceBuffer(const std::string& op_name) {
@@ -1488,211 +140,1374 @@ static std::tuple<int, int, int, bool> ExtractTemplateParamsForSliceBuffer(const
     return std::make_tuple(second_param, third_param, forth_param, false);
 }
 
-void CodeGenTileLangPTOAS::ReduceOpCodegen(const CallNode *op) {
-  std::string op_name = Downcast<StringImm>(op->args[0])->value;
-
-  //Determine whether the reduce operation needs to be sliced.
-  auto template_params = ExtractTemplateParamsForSliceBuffer(op_name);
-  int param2_int = std::get<0>(template_params);
-  int param3_int = std::get<1>(template_params);
-  int param4_int = std::get<2>(template_params);
-  std::string param2 = std::to_string(param2_int);
-  std::string param3 = std::to_string(param3_int);
-  std::string mode = "";
-  if (param4_int == -1) {
-    mode = "row";
-  } else if (param4_int == 0) {
-    mode = "col";
-  } else {
-    ICHECK(false) << "Only row-wise or column-wise reduce operations are supported. Row direction is denoted by -1, and column direction by 0.";
+// Normalize a given MLIR type to a form suitable for arith dialect ops.
+// Input: any mlir::Type
+// Output: canonical "arith-friendly" mlir::Type (e.g. signless integer of same width,
+//         floats/index returned as-is). Other types are returned unchanged.
+static mlir::Type NormalizeArithType(mlir::Type inType, mlir::OpBuilder &builder) {
+  // Integers -> signless integer of same width (arith expects signless ints)
+  if (mlir::isa<mlir::IntegerType>(inType)) {
+    unsigned width = mlir::cast<mlir::IntegerType>(inType).getWidth();
+    return mlir::IntegerType::get(builder.getContext(), width);
   }
-
-  bool success = std::get<3>(template_params);
-  if (!success) {
-    ICHECK(false) << "ExtractTemplateParams failed";
+  // Floats are already fine for arith ops
+  if (mlir::isa<mlir::FloatType>(inType)) {
+    return inType;
   }
-
-  if (op_name.find("reduce_sum") != std::string::npos) {
-    op_name = (mode == "row") ? "TROWSUM" : "TCOLSUM";
-  } else if (op_name.find("reduce_max") != std::string::npos) {
-    op_name = (mode == "row") ? "TROWMAX" : "TCOLMAX";
-  } else {
-    ICHECK(false) << "not support reduce type: " << op_name;
+  // Index type is a distinct legal type for many arith ops
+  if (inType.isIndex()) {
+    return inType;
   }
-
-  std::vector<std::string> var_names;
-  for (int i = 1; i < op->args.size(); i++) {
-    auto var_name = PrintBufferOffset(op->args[i].as<CallNode>());
-    var_names.push_back(var_name);
-  }
-  std::string ub_name = var_names[0];
-  std::vector<std::string> ub_data_vector = ub_data_map_[ub_name];
-  std::string ub_data_type = ub_data_vector[0];
-  std::string row = ub_data_vector[2];
-  std::string col = ub_data_vector[1];
-  std::string ffts = ub_data_vector[3];
-
-  std::string ub_name_src = var_names[1];
-  std::vector<std::string> ub_data_vector_src = ub_data_map_[ub_name_src];
-  std::string ub_data_type_src = ub_data_vector_src[0];
-  std::string row_src = ub_data_vector_src[1];
-  std::string col_src = ub_data_vector_src[2];
-  std::string ffts_src = ub_data_vector_src[3];
-
-  std::string ub_name_tmp = var_names[2];
-  std::vector<std::string> ub_data_vector_tmp = ub_data_map_[ub_name_tmp];
-  std::string ub_data_type_tmp = ub_data_vector_tmp[0];
-  std::string row_tmp = ub_data_vector_tmp[1];
-  std::string col_tmp = ub_data_vector_tmp[2];
-  std::string ffts_tmp = ub_data_vector_tmp[3];
-
-  // Determine whether to request the TileUbData with DN arrangement.
-  ICHECK(ub_data_vector.size() == 5) << "TileUbData needs 5 elements (type, row, col, ffts, applied DN or not), got " << ub_data_vector.size() << ".";
-  if (mode == "row") {
-    if (ub_data_vector[4] == "Unapplied for tileUbDataDN") { //If not applied yet, prioritize applying for it.
-      this->PrintIndent();
-      this->stream << kAscendPtoScope << "TileUbDataDN <" << ub_data_type << ", " << row << ", " << col << ", " << row_src << ", " << col << "> " << ub_name << "_DN;\n";
-      this->PrintIndent();
-      this->stream << "TASSIGN(" << ub_name << "_DN, " << ffts << ");\n";
-      if (param2 == row_src && param3 == col_src) {
-        this->PrintIndent();
-        this->stream << op_name << "(";
-        for (int i = 0; i < var_names.size(); i++) {
-          this->stream << var_names[i];
-          if (i == 0) {
-            this->stream << "_DN";
-          }
-          if (i != var_names.size() - 1) {
-            this->stream << ", ";
-          }
-        }
-        this->stream << ");\n";
-      } else {
-        if (op_name == "TROWMAX") {
-          this->PrintIndent();
-          this->stream << kAscendPtoScope << "TROWMAX_with_slice_buffer <" << ub_data_type_src << ", " << ub_data_type << ", " << ub_data_type_tmp << ", " << row_src << ", " << col_src << ", " << param2 << ", " << param3 << ", " << row << ", " << row_tmp << ", " << col_tmp << "> (" << ffts_src << ", " << ffts << ", " << ub_name << "_DN, " << ub_name_tmp <<");\n";
-        } else if (op_name == "TROWSUM") {
-          this->PrintIndent();
-          this->stream << kAscendPtoScope << "TROWSUM_with_slice_buffer <" << ub_data_type_src << ", " << ub_data_type << ", " << ub_data_type_tmp << ", " << row_src << ", " << col_src << ", " << param2 << ", " << param3 << ", " << row << ", " << row_tmp << ", " << col_tmp << "> (" << ffts_src << ", " << ffts << ", " << ub_name << "_DN, " << ub_name_tmp <<");\n";
-        }
-      }
-      this->PrintIndent();
-      this->stream << "pipe_barrier(PIPE_ALL);\n";
-      this->PrintIndent();
-      this->stream << "TRESHAPE(" << var_names[0] << ", " << var_names[0] << "_DN);\n";
-      ub_data_vector[4] = "Applied for tileUbDataDN";
-    } else if (ub_data_vector[4] == "Applied for tileUbDataDN") { //If already applied, leverage the existing application.
-      this->PrintIndent();
-      this->stream << op_name << "(";
-      for (int i = 0; i < var_names.size(); i++) {
-        this->stream << var_names[i];
-        if (i == 0) {
-          this->stream << "_DN";
-        }
-        if (i != var_names.size() - 1) {
-          this->stream << ", ";
-        }
-      }
-      this->stream << ");\n";
-      this->PrintIndent();
-      this->stream << "pipe_barrier(PIPE_ALL);\n";
-      this->PrintIndent();
-      this->stream << "TRESHAPE(" << var_names[0] << ", " << var_names[0] << "_DN);\n";
-    } else {
-      ICHECK(false) << "Error route in ReduceOpCodegen";
-    }
-  } else {
-    this->PrintIndent();
-    if (param2 == row_src && param3 == col_src) {
-      this->stream << op_name << "(";
-      for (int i = 0; i < var_names.size() - 1; i++) {
-        this->stream << var_names[i];
-        if (i != var_names.size() - 2) {
-          this->stream << ", ";
-        }
-      }
-      if (op_name == "TCOLSUM") {
-        this->stream << ", " << ub_name_tmp << ", true";
-      }
-      this->stream << ");\n";
-    } else {
-      this->stream << kAscendPtoScope << op_name << "_with_slice_buffer <" << ub_data_type_src << ", " << ub_data_type << ", " << ub_data_type_tmp << ", " << row_src << ", " << col_src << ", " << param2 << ", " << param3 << ", " << row << ", " << row_tmp << ", " << col_tmp << "> (" << ffts_src << ", " << ffts << ", " << ub_name << ", " << ub_name_tmp <<");\n";
-    }
-  }
+  // Fallback: return the input type unchanged for cases we don't explicitly canonicalize.
+  return inType;
 }
 
-void CodeGenTileLangPTOAS::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == "threadblock_swizzle_pattern") {
-    this->PrintIndent();
-    const StringImmNode *pattern = op->value.as<StringImmNode>();
-    ICHECK(pattern);
-    this->stream << this->block_id_ << " = " << pattern->value << "("
-                 << this->block_id_ << ");\n";
-    this->VisitStmt(op->body);
-    return;
-  } else if (op->attr_key == "thread_extent") {
-    IterVar iv = Downcast<IterVar>(op->node);
-    if (iv->thread_tag == "blockIdx.x" && iv->var->name_hint != "_") {
-      this->block_id_ = AllocVarID(iv->var.get());
-      this->PrintIndent();
-      auto current_block_id = this->block_id_;
-      if (this->use_swizzle_) {
-        current_block_id = current_block_id + "_";
-      }
-      this->stream << "auto " << current_block_id
-                   << " = get_block_idx();\n";
-      this->PrintIndent();
-      stream << "set_ffts_base_addr(ffts_Addr);\n\n";
+// Convert a TVM runtime::DataType into an MLIR type that is legal for arith ops.
+// This is a convenience wrapper: it first resolves the primitive MLIR type
+// (resolvePrimitiveType) and then canonicalizes it for arith (signless ints, etc).
+mlir::Type CodeGenPTOAS::resolveArithType(const tvm::runtime::DataType &dtype) {
+  // Resolve the primitive MLIR type first (may be signed integer, float, etc).
+  mlir::Type prim = resolvePrimitiveType(dtype);
+  // Normalize to arith-friendly form (signless integers, float/index pass-through).
+  return NormalizeArithType(prim, builder);
+}
 
-      this->core_num_ = PrintExpr(op->value);
-    } else if (iv->thread_tag == "blockIdx.y" && iv->var->name_hint != "_") {
-      this->vec_id_ = AllocVarID(iv->var.get());
-      this->PrintIndent();
-      auto current_vec_id = this->vec_id_;
-      this->stream << "auto " << current_vec_id
-                   << " = get_subblockid();\n";
+// Helper: convert `val` to `dstType`. `dstSigned` indicates desired signedness for integer dst.
+static mlir::Value CastVal(mlir::OpBuilder &builder,
+                           mlir::Location loc,
+                           mlir::Value val,
+                           mlir::Type dstType,
+                           bool dstSigned) {
+  if (!val) return mlir::Value();
+  mlir::Type srcType = val.getType();
+  if (srcType == dstType) return val;
+
+  // index <-> integer conversions
+  if (srcType.isIndex() && mlir::isa<mlir::IntegerType>(dstType)) {
+    return builder.create<mlir::arith::IndexCastOp>(loc, dstType, val).getResult();
+  }
+  if (mlir::isa<mlir::IntegerType>(srcType) && dstType.isIndex()) {
+    // when converting to index, use dstType (index) as-is
+    return builder.create<mlir::arith::IndexCastOp>(loc, dstType, val).getResult();
+  }
+
+  // integer -> integer (extend / trunc)
+  if (mlir::isa<mlir::IntegerType>(srcType) && mlir::isa<mlir::IntegerType>(dstType)) {
+    int srcBits = mlir::cast<mlir::IntegerType>(srcType).getWidth();
+    int dstBits = mlir::cast<mlir::IntegerType>(dstType).getWidth();
+    if (dstBits > srcBits) {
+      // choose signed/unsigned extend based on requested signedness
+      return dstSigned
+          ? builder.create<mlir::arith::ExtSIOp>(loc, dstType, val).getResult()
+          : builder.create<mlir::arith::ExtUIOp>(loc, dstType, val).getResult();
+    } else if (dstBits < srcBits) {
+      return builder.create<mlir::arith::TruncIOp>(loc, dstType, val).getResult();
+    } else {
+      // same width but ensure canonical unsigned destination type
+      return builder.create<mlir::arith::IndexCastOp>(loc, dstType, val).getResult();
     }
-    this->VisitStmt(op->body);
-    return;
-  } else if (op->attr_key == "resource_scope") { // other core
+  }
+
+  // float <-> integer conversions
+  if (mlir::isa<mlir::FloatType>(srcType) && mlir::isa<mlir::IntegerType>(dstType)) {
+    // FP -> int: pick signed/unsigned op, but destination type must be unsigned canonical
+    return dstSigned
+        ? builder.create<mlir::arith::FPToSIOp>(loc, dstType, val).getResult()
+        : builder.create<mlir::arith::FPToUIOp>(loc, dstType, val).getResult();
+  }
+  if (mlir::isa<mlir::IntegerType>(srcType) && mlir::isa<mlir::FloatType>(dstType)) {
+    // int -> float: choose op based on source signedness (source kept as-is)
+    return mlir::cast<mlir::IntegerType>(srcType).isSigned()
+        ? builder.create<mlir::arith::SIToFPOp>(loc, dstType, val).getResult()
+        : builder.create<mlir::arith::UIToFPOp>(loc, dstType, val).getResult();
+  }
+
+  // float -> float (ext / trunc)
+  if (mlir::isa<mlir::FloatType>(srcType) && mlir::isa<mlir::FloatType>(dstType)) {
+    int srcBits = mlir::cast<mlir::FloatType>(srcType).getWidth();
+    int dstBits = mlir::cast<mlir::FloatType>(dstType).getWidth();
+    if (dstBits > srcBits) {
+      return builder.create<mlir::arith::ExtFOp>(loc, dstType, val).getResult();
+    } else {
+      return builder.create<mlir::arith::TruncFOp>(loc, dstType, val).getResult();
+    }
+  }
+
+  // Fallback: if nothing matches, try an IndexCast fallback to normalized dst
+  return builder.create<mlir::arith::IndexCastOp>(loc, dstType, val).getResult();
+}
+
+template <typename OpTy>
+static void EmitUnaryOp(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto src = self->GetAsTile(call->args[1]);
+  builder.create<OpTy>(loc, src, res);
+}
+
+template <typename OpTy>
+static void EmitUnaryOpWithFAttr(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call, mlir::FloatAttr attr) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto src = self->GetAsTile(call->args[1]);
+  builder.create<OpTy>(loc, src, res, attr);
+}
+
+template <typename OpTy>
+static void EmitBinaryOpWithFlag(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call, bool flag) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto lhs = self->GetAsTile(call->args[1]);
+  auto rhs = self->GetAsTile(call->args[2]);
+  builder.create<OpTy>(loc, lhs, rhs, res, mlir::BoolAttr::get(&self->context, flag));
+}
+
+template <typename OpTy>
+static void EmitBinaryOp(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto lhs = self->GetAsTile(call->args[1]);
+  auto rhs = self->GetAsTile(call->args[2]);
+  builder.create<OpTy>(loc, lhs, rhs, res);
+}
+
+template <typename OpTy>
+static void EmitScalarBinaryOp(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto lhs = self->GetAsTile(call->args[1]);
+  mlir::Value rhs;
+  if (call->args[2].as<CallNode>()) {
+    auto dtype = self->resolveArithType(call->args[2].as<CallNode>()->args[0]->dtype);
+    auto stile = self->GetAsTile(call->args[2]);
+    auto sidx = CastVal(builder, loc, self->VisitExpr(call->args[3]), builder.getIndexType(), false);
+    builder.create<mlir::pto::BarrierOp>(loc, mlir::pto::PipeAttr::get(&self->context, mlir::pto::PIPE::PIPE_ALL));
+    rhs = builder.create<mlir::pto::TGetValOp>(loc, dtype, stile, sidx).getResult();
+  } else {
+    rhs = self->VisitExpr(call->args[2]);
+  }
+  builder.create<OpTy>(loc, lhs, rhs, res);
+}
+
+template <typename OpTy>
+static void EmitScalarBinaryOpWithFlag(CodeGenPTOAS *self, mlir::OpBuilder &builder, mlir::Location loc, const CallNode *call, bool flag) {
+  auto res = self->GetAsTile(call->args[0]);
+  auto lhs = self->GetAsTile(call->args[1]);
+  auto rhs = self->VisitExpr(call->args[2]);
+  builder.create<OpTy>(loc, lhs, rhs, res);
+}
+
+void CodeGenPTOAS::VisitStmt_(const LetStmtNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  mlir::Value value = VisitExpr(op->value);
+  if (!value) {
+    LOG(FATAL) << "Failed to generate value for LetStmt: " << op->var->name_hint;
+  }
+  symbolTable[op->var.get()].sym = value;
+  VisitStmt(op->body);
+}
+
+void CodeGenPTOAS::VisitStmt_(const AttrStmtNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  // Handle the attribute statement
+  if (op->attr_key == "thread_extent") {
+    IterVar iv = Downcast<IterVar>(op->node);
+    mlir::Value rawIdx;
+    if (iv->thread_tag == "blockIdx.x") {
+      rawIdx = builder.create<mlir::pto::GetBlockIdxOp>(loc).getResult();
+      core_num_ = CGC.PrintExpr(op->value);
+    } else if (iv->thread_tag == "blockIdx.y") {
+      rawIdx = builder.create<mlir::pto::GetSubBlockIdxOp>(loc).getResult();
+    } else {
+      LOG(FATAL) << "Unsupported thread_tag: " << iv->thread_tag;
+    }
+
+    // Resolve desired MLIR type for the IterVar's var
+    mlir::Type dstType = resolveArithType(iv->var.dtype());
+    bool dstSigned = iv->var.dtype().is_int();
+
+    mlir::Value idxVal = CastVal(builder, loc, rawIdx, dstType, dstSigned);
+    if (!idxVal) {
+      LOG(FATAL) << "Failed to convert block index value for " << iv->var->name_hint;
+    }
+    symbolTable[iv->var.get()].sym = idxVal;
+    VisitStmt(op->body);
+  } else if (op->attr_key == "resource_scope") {
     auto resource_id = Downcast<IntImm>(op->value)->value;
     auto resource_name = resource_id == 0 ? "CUBE" : "VEC";
-    std::string arch_name = (this->platform_ == "A5") ? "C310" : "C220";
+    std::string old_scope = source_scope;
 
-    stream << "#if defined(__DAV_" << arch_name << "_" << resource_name << "__)\n";
-    if (resource_name == "VEC") {
-      this->PrintIndent();
-      stream << "  set_mask_norm();\n";
-      this->PrintIndent();
-      stream << "  set_vector_mask(-1, -1);\n";
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      source_scope = resource_name;
+      mlir::Region *region;
+      if (resource_id == 0) {
+        region = &builder.create<mlir::pto::SectionCubeOp>(loc).getBody();
+      } else {
+        region = &builder.create<mlir::pto::SectionVectorOp>(loc).getBody();
+      }
+      auto &block = region->emplaceBlock();
+      builder.setInsertionPointToStart(&block);
+
+      VisitStmt(op->body);
     }
 
-    std::string old_scope = this->current_resource_scope_;
-    this->current_resource_scope_ = resource_name;
-
-    int func_scope = this->BeginScope();
-    this->VisitStmt(op->body);
-    this->EndScope(func_scope);
-    stream << "#endif\n";
-
-    this->current_resource_scope_ = old_scope;
-    return;
+    source_scope = old_scope;
+  } else {
+    LOG(FATAL) << "Unsupported attribute: " << op->attr_key;
   }
-  CodeGenC::VisitStmt_(op);
 }
 
-void CodeGenTileLangPTOAS::UbShapeInputCheck(const AllocateNode *op) {
-  auto shape = buffer_shapess_[op->buffer_var];
+static std::pair<bool, int64_t> try_eval(const PrimExpr &shape) {
+  if (const auto *c = shape.as<IntImmNode>()) {
+    return {true, c->value};
+  } else {
+    return {false, -1};
+  }
+}
+
+static int64_t eval(const PrimExpr &shape) {
+  if (const auto *c = shape.as<IntImmNode>()) {
+    return c->value;
+  } else {
+    LOG(FATAL) << "Only constant shapes are supported, got: " << shape;
+    return -1;
+  }
+}
+
+void CodeGenPTOAS::VisitStmt_(const AllocateNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  std::string scope = GetPtrStorageScope(op->buffer_var);
+  const VarNode *buffer = op->buffer_var.as<VarNode>();
+  auto type = resolveArithType(op->dtype);
+
+  auto shape = buffer_shapes_[op->buffer_var];
+  std::vector<int64_t> gshape;
+
+  if (scope == "shared") {
+    if (shape.size() == 2) {
+      gshape.push_back(eval(shape[0]));
+      gshape.push_back(eval(shape[1]));
+      auto ub = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::VEC);
+      auto bl = BLayoutAttr::get(&context, BLayout::RowMajor);
+      if (gshape[1] == 1) {
+        // HACK: store in rowmajor to satisfy the requirement of the 32-byte alignment of columns.
+        std::swap(gshape[0], gshape[1]);
+        symbolTable[buffer].need_reshape_for_reduce = true;
+      }
+      auto sl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto pd = PadValueAttr::get(&context, PadValue::Null);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, ub, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else if (shape.size() == 1) {
+      gshape.push_back(1);
+      gshape.push_back(eval(shape[0]));
+      auto ub = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::VEC);
+      auto bl = BLayoutAttr::get(&context, BLayout::RowMajor);
+      auto sl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto pd = PadValueAttr::get(&context, PadValue::Null);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, ub, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else {
+      LOG(FATAL) << "Only 2D shared memory allocation is supported, got shape size: " << shape.size();
+    }
+  } else if (scope == "shared.dyn") {
+    if (shape.size() == 2) {
+      gshape.push_back(eval(shape[0]));
+      gshape.push_back(eval(shape[1]));
+      auto mat = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::MAT);
+      auto bl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto sl = SLayoutAttr::get(&context, SLayout::RowMajor);
+      auto pd = PadValueAttr::get(&context, PadValue::Zero);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, mat, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else {
+      LOG(FATAL) << "Only 2D dynamic shared memory allocation is supported, got shape size: " << shape.size();
+    }
+  } else if (scope == "wmma.accumulator") {
+    if (shape.size() == 2) {
+      gshape.push_back(eval(shape[0]));
+      gshape.push_back(eval(shape[1]));
+      auto acc = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::ACC);
+      auto bl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto sl = SLayoutAttr::get(&context, SLayout::RowMajor);
+      auto pd = PadValueAttr::get(&context, PadValue::Null);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 1024);
+
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, acc, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else {
+      LOG(FATAL) << "Only 2D WMMA accumulator memory allocation is supported, got shape size: " << shape.size();
+    }
+  } else if (scope == "wmma.matrix_a") {
+    if (shape.size() == 2) {
+      gshape.push_back(eval(shape[0]));
+      gshape.push_back(eval(shape[1]));
+      auto left = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::LEFT);
+      auto bl = BLayoutAttr::get(&context, BLayout::RowMajor);
+      auto sl = SLayoutAttr::get(&context, SLayout::RowMajor);
+      auto pd = PadValueAttr::get(&context, PadValue::Null);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, left, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else {
+      LOG(FATAL) << "Only 2D WMMA matrix A memory allocation is supported, got shape size: " << shape.size();
+    }
+  } else if (scope == "wmma.matrix_b") {
+    if (shape.size() == 2) {
+      gshape.push_back(eval(shape[0]));
+      gshape.push_back(eval(shape[1]));
+      auto right = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::RIGHT);
+      auto bl = BLayoutAttr::get(&context, BLayout::RowMajor);
+      auto sl = SLayoutAttr::get(&context, SLayout::ColMajor);
+      auto pd = PadValueAttr::get(&context, PadValue::Null);
+      auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cfg = mlir::pto::TileBufConfigAttr::get(&context, bl, sl, fractal, pd);
+      auto tile = mlir::pto::TileBufType::get(&context, gshape, type, right, gshape, cfg);
+      auto alloca = builder.create<mlir::pto::AllocTileOp>(loc, tile, mlir::Value(), mlir::Value());
+      symbolTable[buffer].sym = alloca.getResult();
+    } else {
+      LOG(FATAL) << "Only 2D WMMA matrix B memory allocation is supported, got shape size: " << shape.size();
+    }
+  } else {
+    LOG(FATAL) << "Unsupported allocation scope: " << scope;
+  }
+  VisitStmt(op->body);
+}
+
+void CodeGenPTOAS::VisitStmt_(const SeqStmtNode *op) {
+  for (const Stmt &stmt : op->seq) {
+    this->VisitStmt(stmt);
+  }
+}
+
+void CodeGenPTOAS::VisitStmt_(const EvaluateNode *op) {
+  // evaluate expression and ignore its result
+  VisitExpr(op->value);
+}
+
+static void GenLoopUnroll(CodeGenPTOAS *self, const ForNode *op) {
+  mlir::Location loc = self->builder.getUnknownLoc();
+  int64_t min = eval(op->min);
+  int64_t extent = eval(op->extent);
+  for (int64_t i = 0; i < extent; ++i) {
+    mlir::Value loopVar = self->builder.create<mlir::arith::ConstantOp>(
+        loc,
+        self->resolveArithType(op->loop_var.dtype()),
+        self->builder.getIntegerAttr(self->resolveArithType(op->loop_var.dtype()), min + i)).getResult();
+    self->symbolTable[op->loop_var.get()].sym = loopVar;
+    self->VisitStmt(op->body);
+  }
+}
+
+static void GenLoopNormal(CodeGenPTOAS *self, const ForNode *op) {
+  mlir::Location loc = self->builder.getUnknownLoc();
+  mlir::Value lb = CastVal(self->builder, loc, self->VisitExpr(op->min), self->builder.getIndexType(), false);
+  mlir::Value ext = CastVal(self->builder, loc, self->VisitExpr(op->extent), self->builder.getIndexType(), false);
+  if (!lb || !ext) {
+    LOG(FATAL) << "Failed to generate loop bounds for for-loop.";
+  }
+  auto one = self->builder.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+  // ub = lb + extent
+  mlir::Value ub = self->builder.create<mlir::arith::AddIOp>(loc, lb, ext).getResult();
+
+  auto forOp = self->builder.create<mlir::scf::ForOp>(loc, lb, ub, one);
+
+  // Emit loop body into the created region, map induction var to expected arith-legal type.
+  {
+    mlir::OpBuilder::InsertionGuard guard(self->builder);
+    auto &body = forOp.getRegion().front();
+    self->builder.setInsertionPointToStart(&body);
+
+    // induction var is body.getArgument(0) (index type). Cast to the loop_var's dtype.
+    mlir::Type dstType = self->resolveArithType(op->loop_var.dtype());
+    bool dstSigned = op->loop_var.dtype().is_int();
+    mlir::Value iv_index = body.getArgument(0);
+    mlir::Value iv_cast = CastVal(self->builder, loc, iv_index, dstType, dstSigned);
+    if (!iv_cast) {
+      LOG(FATAL) << "Failed to cast induction variable for " << op->loop_var->name_hint;
+    }
+    self->symbolTable[op->loop_var.get()].sym = iv_cast;
+
+    // Emit loop body
+    self->VisitStmt(op->body);
+  }
+}
+
+void CodeGenPTOAS::VisitStmt_(const ForNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  if (op->kind == tir::ForKind::kSerial) {
+#if 0
+    GenLoopUnroll(this, op);
+#else
+    GenLoopNormal(this, op);
+#endif
+  } else {
+    LOG(FATAL) << "Only serial for-loops are supported.";
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const BufferLoadNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  std::string scope = op->buffer.scope();
+  auto sym = symbolTable[op->buffer->data.get()].sym;
+  auto off = CastVal(builder, loc, VisitExpr(op->indices.back()), builder.getIndexType(), false);
+  auto dtype = resolveArithType(op->dtype);
+  if (scope == "" || scope == "global") {
+    LOG(FATAL) << "Global memory access is not supported yet.";
+  } else {
+    return builder.create<mlir::pto::TGetValOp>(loc, dtype, sym, off).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const IntImmNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  mlir::Type type = builder.getIntegerType(op->dtype.bits());
+  mlir::IntegerAttr intAttr = builder.getIntegerAttr(type, op->value);
+  return builder.create<mlir::arith::ConstantOp>(loc, type, intAttr).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const VarNode *op) {
+  if (symbolTable.count(op)) {
+    return symbolTable.at(op).sym;
+  } else {
+    LOG(FATAL) << "Undefined variable: " << op->name_hint;
+    return nullptr;
+  }
+}
+
+static mlir::pto::PIPE GetPipe(const std::string &pipe_name) {
+  if (pipe_name == "ALL") {
+    return mlir::pto::PIPE::PIPE_ALL;
+  } else if (pipe_name == "MTE1") {
+    return mlir::pto::PIPE::PIPE_MTE1;
+  } else if (pipe_name == "MTE2") {
+    return mlir::pto::PIPE::PIPE_MTE2;
+  } else if (pipe_name == "MTE3") {
+    return mlir::pto::PIPE::PIPE_MTE3;
+  } else if (pipe_name == "MTE4") {
+    return mlir::pto::PIPE::PIPE_MTE4;
+  } else if (pipe_name == "MTE5") {
+    return mlir::pto::PIPE::PIPE_MTE5;
+  } else if (pipe_name == "S") {
+    return mlir::pto::PIPE::PIPE_S;
+  } else if (pipe_name == "V") {
+    return mlir::pto::PIPE::PIPE_V;
+  } else if (pipe_name == "M") {
+    return mlir::pto::PIPE::PIPE_M;
+  } else if (pipe_name == "V2") {
+    return mlir::pto::PIPE::PIPE_V2;
+  } else if (pipe_name == "FIX") {
+    return mlir::pto::PIPE::PIPE_FIX;
+  } else if (pipe_name == "L1A") {
+    return mlir::pto::PIPE::VIRTUAL_PIPE_MTE2_L1A;
+  } else if (pipe_name == "L1B") {
+    return mlir::pto::PIPE::VIRTUAL_PIPE_MTE2_L1B;
+  } else if (pipe_name == "NUM") {
+    return mlir::pto::PIPE::PIPE_NUM;
+  } else {
+    LOG(FATAL) << "Unsupported pipe name: " << pipe_name;
+  }
+}
+
+static std::map<std::string, std::string> extractTemplateParams(const std::string& input) {
+    std::map<std::string, std::string> result;
+    size_t start = input.find('<');
+    size_t end = input.rfind('>');
+
+    if (start == std::string::npos || end == std::string::npos || start >= end) {
+        return result;
+    }
+    std::string inner = input.substr(start + 1, end - start - 1);
+    std::vector<std::string> params;
+    std::stringstream ss(inner);
+    std::string param;
+    while (std::getline(ss, param, ',')) {
+        param.erase(0, param.find_first_not_of(" \t"));
+        param.erase(param.find_last_not_of(" \t") + 1);
+        params.push_back(param);
+    }
+    std::vector<std::string> paramNames = {
+        "data_type_input",
+        "data_type_output",
+        "M",
+        "N",
+        "K",
+        "transpose_A",
+        "transpose_B"
+    };
+    for (size_t i = 0; i < params.size() && i < paramNames.size(); ++i) {
+        result[paramNames[i]] = params[i];
+    }
+    for (size_t i = paramNames.size(); i < params.size(); ++i) {
+        result["extra_param_" + std::to_string(i - paramNames.size() + 1)] = params[i];
+    }
+    return result;
+}
+
+mlir::Value CodeGenPTOAS::GetAsTile(const PrimExpr &op) {
+  ICHECK(op.as<CallNode>()->op.same_as(builtin::tvm_access_ptr())) << "Illegal tile descriptor.";
+  auto buffer = op.as<CallNode>()->args[1].as<VarNode>();
+  auto offset = op.as<CallNode>()->args[2];
+  auto [succ, offval] = try_eval(offset);
+  if (offval != 0) {
+    auto src = symbolTable.at(buffer).sym;
+    auto loc = builder.getUnknownLoc();
+    auto ttype = llvm::cast<mlir::pto::TileBufType>(src.getType());
+    auto dtype = ttype.getElementType();
+    auto cfg = ttype.getConfig();
+    auto space = ttype.getMemorySpace();
+    auto sizes = ttype.getShape();
+    // FIXME: only support subview one 'row' of a tile!!!
+    std::vector<int64_t> subshape{1, sizes[1]};
+    auto subtype = mlir::pto::TileBufType::get(&context, subshape, dtype, space, subshape, cfg);
+    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    std::vector offsets(sizes.size(), zero);
+    offsets.back() = CastVal(builder, loc, VisitExpr(offset), builder.getIndexType(), false);
+    auto tile = builder.create<mlir::pto::SubsetOp>(loc, subtype, src, offsets, builder.getI64ArrayAttr(subshape)).getResult();
+    return tile;
+  }
+  ICHECK(symbolTable.count(buffer) && symbolTable.at(buffer).sym) << "undefined tile buffer.";
+  return symbolTable.at(buffer).sym;
+}
+
+const tvm::tir::VarNode* CodeGenPTOAS::GetBufferVar(const PrimExpr &op) {
+  ICHECK(op.as<CallNode>()->op.same_as(builtin::tvm_access_ptr())) << "Illegal tile descriptor.";
+  auto buffer = op.as<CallNode>()->args[1].as<VarNode>();
+  return buffer;
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
+  if (op->op.same_as(builtin::call_extern())) {
+    return CallExternCodegen(op);
+  }
+
+  mlir::Location loc = builder.getUnknownLoc();
+
+  if (op->op.same_as(tl::ascend_pipe_barrier())) {
+    auto pipe = GetPipe(Downcast<StringImm>(op->args[0])->value);
+    builder.create<mlir::pto::BarrierOp>(loc, mlir::pto::PipeAttr::get(&context, pipe));
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_wait_cross_flag())) {
+    auto flag = Downcast<IntImm>(op->args[0])->value;
+    auto pstr = Downcast<StringImm>(op->args[1])->value;
+    mlir::pto::PIPE pipe;
+    if (pstr.empty()) {
+      if (this->source_scope == "CUBE") {
+        pipe = mlir::pto::PIPE::PIPE_MTE1;
+      } else if (this->source_scope == "VEC") {
+        pipe = mlir::pto::PIPE::PIPE_V;
+      } else {
+        LOG(FATAL) << "Unknown source scope for wait_cross_flag: " << this->source_scope;
+      }
+    } else {
+      LOG(FATAL) << "Specifying pipe name in wait_cross_flag is not supported yet.";
+    }
+    builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
+    if (this->source_scope == "CUBE") {
+      builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag + 16));
+    }
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_set_cross_flag())) {
+    auto pstr = Downcast<StringImm>(op->args[0])->value;
+    auto flag = Downcast<IntImm>(op->args[1])->value;
+    mlir::pto::PIPE pipe = GetPipe(pstr);
+    builder.create<mlir::pto::SyncSetOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
+    if (this->source_scope == "CUBE") {
+      builder.create<mlir::pto::SyncSetOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag + 16));
+    }
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_fill())) {
+    auto res = GetAsTile(op->args[1]);
+    auto value = VisitExpr(op->args[2]);
+    builder.create<mlir::pto::TExpandsOp>(loc, value, res);
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_gemm_v0())) {
+    auto MTE2 = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_MTE2);
+    auto MTE1 = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_MTE1);
+    auto M = mlir::pto::PipeAttr::get(&context, mlir::pto::PIPE::PIPE_M);
+    auto E0 = mlir::pto::EventAttr::get(&context, mlir::pto::EVENT::EVENT_ID0);
+    builder.create<mlir::pto::SetFlagOp>(loc, MTE2, MTE1, E0);
+    builder.create<mlir::pto::WaitFlagOp>(loc, MTE2, MTE1, E0);
+
+    auto a = GetAsTile(op->args[1]);
+    auto b = GetAsTile(op->args[2]);
+    auto c = GetAsTile(op->args[3]);
+    auto clear = eval(op->args[4]);
+    std::string op_name = Downcast<StringImm>(op->args[0])->value;
+    std::map<std::string, std::string> params = extractTemplateParams(op_name);
+    auto atype = llvm::cast<mlir::pto::TileBufType>(a.getType()).getElementType();
+    auto btype = llvm::cast<mlir::pto::TileBufType>(b.getType()).getElementType();
+    auto dtype = llvm::cast<mlir::pto::TileBufType>(c.getType()).getElementType();
+    auto restype = mlir::RankedTensorType::get(mlir::cast<mlir::pto::TileBufType>(c.getType()).getShape(), dtype);
+
+    auto fractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+    auto pad = PadValueAttr::get(&context, PadValue::Null);
+    auto browmajor = BLayoutAttr::get(&context, BLayout::RowMajor);
+    auto bcolmajor = BLayoutAttr::get(&context, BLayout::ColMajor);
+    auto srowmajor = SLayoutAttr::get(&context, SLayout::RowMajor);
+    auto scolmajor = SLayoutAttr::get(&context, SLayout::ColMajor);
+    auto left = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::LEFT);
+    auto right = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::RIGHT);
+    auto mat = mlir::pto::AddressSpaceAttr::get(&context, mlir::pto::AddressSpace::MAT);
+
+    auto ashape = llvm::cast<mlir::pto::TileBufType>(a.getType()).getShape();
+    std::vector<int64_t> l0ashape{ashape[0], ashape[1]};
+    if (params["transpose_A"] == "true") {
+      std::swap(l0ashape[0], l0ashape[1]);
+      auto Tcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+      auto Tty = mlir::pto::TileBufType::get(&context, l0ashape, atype, mat, l0ashape, Tcfg);
+      auto Ta = builder.create<mlir::pto::AllocTileOp>(loc, Tty, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, a, Ta);
+      a = Ta;
+    }
+    auto l0acfg = mlir::pto::TileBufConfigAttr::get(&context, bcolmajor, srowmajor, fractal, pad);
+    auto l0aty = mlir::pto::TileBufType::get(&context, l0ashape, atype, left, l0ashape, l0acfg);
+    auto l0a = builder.create<mlir::pto::AllocTileOp>(loc, l0aty, mlir::Value(), mlir::Value()).getResult();
+    auto l0aresty = mlir::RankedTensorType::get(l0ashape, atype);
+    builder.create<mlir::pto::TMovOp>(loc, l0aresty, a, l0a);
+
+    auto bshape = llvm::cast<mlir::pto::TileBufType>(b.getType()).getShape();
+    std::vector<int64_t> l0bshape{bshape[0], bshape[1]};
+    if (params["transpose_B"] == "true") {
+      std::swap(l0bshape[0], l0bshape[1]);
+      auto Tcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+      auto Tty = mlir::pto::TileBufType::get(&context, l0bshape, atype, mat, l0bshape, Tcfg);
+      auto Tb = builder.create<mlir::pto::AllocTileOp>(loc, Tty, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, b, Tb);
+      b = Tb;
+    }
+    auto l0bcfg = mlir::pto::TileBufConfigAttr::get(&context, browmajor, scolmajor, fractal, pad);
+    auto l0bty = mlir::pto::TileBufType::get(&context, l0bshape, btype, right, l0bshape, l0bcfg);
+    auto l0b = builder.create<mlir::pto::AllocTileOp>(loc, l0bty, mlir::Value(), mlir::Value()).getResult();
+    auto l0bresty = mlir::RankedTensorType::get(l0bshape, btype);
+    builder.create<mlir::pto::TMovOp>(loc, l0bresty, b, l0b);
+
+    builder.create<mlir::pto::SetFlagOp>(loc, MTE1, M, E0);
+    builder.create<mlir::pto::WaitFlagOp>(loc, MTE1, M, E0);
+
+    if (clear)
+      builder.create<mlir::pto::TMatmulOp>(loc, restype, l0a, l0b, mlir::Value(), c);
+    else
+      builder.create<mlir::pto::TMatmulAccOp>(loc, restype, c, l0a, l0b, c);
+    return mlir::Value();
+  }
+
+  // unary
+  if (op->op.same_as(tl::ascend_exp())) {
+    EmitUnaryOp<mlir::pto::TExpOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_ln())) {
+    EmitUnaryOp<mlir::pto::TLogOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_abs())) {
+    EmitUnaryOp<mlir::pto::TAbsOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_reciprocal())) {
+    EmitUnaryOp<mlir::pto::TRecipOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_sqrt())) {
+    EmitUnaryOp<mlir::pto::TSqrtOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_rsqrt())) {
+    EmitUnaryOp<mlir::pto::TRsqrtOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_relu())) {
+    EmitUnaryOp<mlir::pto::TReluOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_bitwise_not())) {
+    EmitUnaryOp<mlir::pto::TNotOp>(this, builder, loc, op); return mlir::Value();
+  }
+
+  // binary (with flag where applicable)
+  if (op->op.same_as(tl::ascend_add())) {
+    EmitBinaryOp<mlir::pto::TAddOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_sub())) {
+    EmitBinaryOp<mlir::pto::TSubOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_mul())) {
+    EmitBinaryOp<mlir::pto::TMulOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_div())) {
+    EmitBinaryOp<mlir::pto::TDivOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_max())) {
+    EmitBinaryOp<mlir::pto::TMaxOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_min())) {
+    EmitBinaryOp<mlir::pto::TMinOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_bitwise_and())) {
+    EmitBinaryOp<mlir::pto::TAndOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_bitwise_or())) {
+    EmitBinaryOp<mlir::pto::TOrOp>(this, builder, loc, op); return mlir::Value();
+  }
+
+  // scalar/broadcast variants
+  if (op->op.same_as(tl::ascend_adds())) {
+    EmitScalarBinaryOp<mlir::pto::TAddSOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_subs())) {
+    EmitScalarBinaryOp<mlir::pto::TSubSOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_muls())) {
+    EmitScalarBinaryOp<mlir::pto::TMulsOp>(this, builder, loc, op); return mlir::Value();
+  }
+  if (op->op.same_as(tl::ascend_divs())) {
+    EmitScalarBinaryOp<mlir::pto::TDivSOp>(this, builder, loc, op); return mlir::Value();
+  }
+
+  // reduce variants
+  if (op->op.same_as(tl::ascend_reduce())) {
+    std::string opname = Downcast<StringImm>(op->args[0])->value;
+    auto templates = ExtractTemplateParamsForSliceBuffer(opname);
+    auto rdim = std::get<2>(templates);
+    auto res = GetAsTile(op->args[1]);
+    auto src = GetAsTile(op->args[2]);
+
+    // build tmp buffer
+    auto tmpdtype = llvm::cast<mlir::pto::TileBufType>(src.getType()).getElementType();
+    auto tmpcfg = llvm::cast<mlir::pto::TileBufType>(src.getType()).getConfig();
+    auto tmpspace = llvm::cast<mlir::pto::TileBufType>(src.getType()).getMemorySpace();
+    auto shape = llvm::cast<mlir::pto::TileBufType>(src.getType()).getShape();
+    ICHECK(shape.size() == 2) << "Only 2D reduction is supported.";
+    std::vector<int64_t> tmpshape(2);
+    tmpshape[0] = shape[0];
+    tmpshape[1] = 256 * 8 / tmpdtype.getIntOrFloatBitWidth();
+    auto tmpty = mlir::pto::TileBufType::get(&context, tmpshape, tmpdtype, tmpspace, tmpshape, tmpcfg);
+    auto tmp = builder.create<mlir::pto::AllocTileOp>(loc, tmpty, mlir::Value(), mlir::Value()).getResult();
+
+    // maybe reshape res
+    auto origin = res;
+    if (symbolTable[GetBufferVar(op->args[1])].need_reshape_for_reduce) {
+      auto resty = llvm::cast<mlir::pto::TileBufType>(res.getType());
+      auto rmshape = resty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = resty.getElementType();
+      auto cmspace = resty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, res, cmtile);
+      res = cmtile;
+    }
+    if (rdim == -1) {
+      if (opname.find("reduce_sum") != std::string::npos) {
+        builder.create<mlir::pto::TRowSumOp>(loc, src, tmp, res);
+      } else if (opname.find("reduce_max") != std::string::npos) {
+        builder.create<mlir::pto::TRowMaxOp>(loc, src, tmp, res);
+      } else {
+        LOG(FATAL) << "Unsupported reduce operation: " << opname;
+      }
+    } else {
+      LOG(FATAL) << "Unsupported reduce dimension: " << rdim;
+    }
+    if (origin != res) {
+      builder.create<mlir::pto::TReshapeOp>(loc, res, origin);
+    }
+    return mlir::Value();
+  }
+
+  // broadcast variants
+  if (op->op.same_as(tl::ascend_broadcast())) {
+    auto res = GetAsTile(op->args[1]);
+    auto src = GetAsTile(op->args[2]);
+    // maybe reshape src
+    auto origin = src;
+    if (symbolTable[GetBufferVar(op->args[2])].need_reshape_for_reduce) {
+      auto srcty = llvm::cast<mlir::pto::TileBufType>(src.getType());
+      auto rmshape = srcty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = srcty.getElementType();
+      auto cmspace = srcty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, src, cmtile);
+      src = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandOp>(loc, src, res);
+    if (origin != src) {
+      builder.create<mlir::pto::TReshapeOp>(loc, src, origin);
+    }
+    return mlir::Value();
+  }
+
+  LOG(FATAL) << "Unsupported call operation: " << op->op;
+  return nullptr;
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const FloatImmNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  mlir::Type type = resolveArithType(op->dtype);
+  mlir::FloatAttr fattr = mlir::FloatAttr::get(type, op->value);
+  return builder.create<mlir::arith::ConstantOp>(loc, type, fattr).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const StringImmNode *op) {
+  LOG(FATAL) << "StringImm used where an MLIR value is expected: " << op->value;
+  return nullptr;
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const CastNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto val = VisitExpr(op->value);
+  mlir::Type dst = resolveArithType(op->dtype);
+  // If same type, just pass through.
+  if (val.getType() == dst) return val;
+
+  bool dst_is_float = op->dtype.is_float();
+  bool src_is_float = op->value.dtype().is_float();
+  if (src_is_float && !dst_is_float) {
+    // float -> int
+    if (op->value.dtype().is_int()) {
+      return builder.create<mlir::arith::FPToSIOp>(loc, dst, val).getResult();
+    } else {
+      return builder.create<mlir::arith::FPToUIOp>(loc, dst, val).getResult();
+    }
+  } else if (!src_is_float && dst_is_float) {
+    // int -> float
+    if (op->value.dtype().is_int()) {
+      return builder.create<mlir::arith::SIToFPOp>(loc, dst, val).getResult();
+    } else {
+      return builder.create<mlir::arith::UIToFPOp>(loc, dst, val).getResult();
+    }
+  } else if (!src_is_float && !dst_is_float) {
+    // integer -> integer (extend/trunc)
+    int src_bits = op->value.dtype().bits();
+    int dst_bits = op->dtype.bits();
+    if (dst_bits > src_bits) {
+      if (op->value.dtype().is_int()) {
+        return builder.create<mlir::arith::ExtSIOp>(loc, dst, val).getResult();
+      } else {
+        return builder.create<mlir::arith::ExtUIOp>(loc, dst, val).getResult();
+      }
+    } else {
+      return builder.create<mlir::arith::TruncIOp>(loc, dst, val).getResult();
+    }
+  } else {
+    // float -> float (ext / trunc)
+    int src_bits = op->value.dtype().bits();
+    int dst_bits = op->dtype.bits();
+    if (dst_bits > src_bits) {
+      return builder.create<mlir::arith::ExtFOp>(loc, dst, val).getResult();
+    } else {
+      return builder.create<mlir::arith::TruncFOp>(loc, dst, val).getResult();
+    }
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const AddNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::AddFOp>(loc, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::AddIOp>(loc, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const SubNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::SubFOp>(loc, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::SubIOp>(loc, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const MulNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::MulFOp>(loc, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::MulIOp>(loc, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const DivNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::DivFOp>(loc, a, b).getResult();
+  } else {
+    if (op->dtype.is_uint()) {
+      return builder.create<mlir::arith::DivUIOp>(loc, a, b).getResult();
+    } else {
+      return builder.create<mlir::arith::DivSIOp>(loc, a, b).getResult();
+    }
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const ModNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::RemFOp>(loc, a, b).getResult();
+  } else {
+    if (op->dtype.is_uint()) {
+      return builder.create<mlir::arith::RemUIOp>(loc, a, b).getResult();
+    } else {
+      return builder.create<mlir::arith::RemSIOp>(loc, a, b).getResult();
+    }
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const MinNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    // min(a,b) -> select(a < b, a, b)
+    auto cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OLT, a, b).getResult();
+    return builder.create<mlir::arith::SelectOp>(loc, cmp, a, b).getResult();
+  } else {
+    auto cmp = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt, a, b).getResult();
+    return builder.create<mlir::arith::SelectOp>(loc, cmp, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const MaxNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    auto cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, a, b).getResult();
+    return builder.create<mlir::arith::SelectOp>(loc, cmp, a, b).getResult();
+  } else {
+    auto cmp = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::sgt, a, b).getResult();
+    return builder.create<mlir::arith::SelectOp>(loc, cmp, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const LTNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OLT, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::slt, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const LENode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OLE, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::sle, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const GTNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::sgt, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const GENode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGE, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::sge, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const EQNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OEQ, a, b).getResult();
+  } else {
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::eq, a, b).getResult();
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const NENode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto eq = VisitExpr_(op->a.template as<EQNode>()); // fall back: build eq then xor
+  // safer explicit compute:
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  if (op->dtype.is_float()) {
+    auto cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::ONE, a, b).getResult();
+    return cmp;
+  } else {
+    auto cmp = builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, a, b).getResult();
+    return cmp;
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const AndNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  return builder.create<mlir::arith::AndIOp>(loc, a, b).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const OrNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+  return builder.create<mlir::arith::OrIOp>(loc, a, b).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const NotNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto v = VisitExpr(op->a);
+  if (!v) return mlir::Value();
+  // Compute xor with 1 for boolean/integer negation
+  auto one = builder.create<mlir::arith::ConstantOp>(loc, builder.getIntegerAttr(builder.getIntegerType(1), 1)).getResult();
+  return builder.create<mlir::arith::XOrIOp>(loc, v, one).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const SelectNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+  auto cond = VisitExpr(op->condition);
+  auto t = VisitExpr(op->true_value);
+  auto f = VisitExpr(op->false_value);
+  if (!cond || !t || !f) return mlir::Value();
+  return builder.create<mlir::arith::SelectOp>(loc, cond, t, f).getResult();
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const LetNode *op) {
+  // Evaluate value, bind to symbol, evaluate body, then restore previous binding.
+  auto varnode = op->var.as<VarNode>();
+  mlir::Value v = VisitExpr(op->value);
+  if (!v) return mlir::Value();
+  mlir::Value prev = nullptr;
+  if (symbolTable.count(varnode)) {
+    prev = symbolTable[varnode].sym;
+  }
+  symbolTable[varnode].sym = v;
+  mlir::Value res = VisitExpr(op->body);
+  if (prev) {
+    symbolTable[varnode].sym = prev;
+  } else {
+    symbolTable.erase(varnode);
+  }
+  return res;
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const FloorDivNode *op) {
+  // Inputs are guaranteed positive => floor(a/b) == trunc(a/b) for integers.
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+
+  if (op->dtype.is_float()) {
+    // float floor-div: use floating division (for positive values this is fine)
+    return builder.create<mlir::arith::DivFOp>(loc, a, b).getResult();
+  } else {
+    // integers (positive): truncating integer division equals floor division
+    if (op->dtype.is_uint()) {
+      return builder.create<mlir::arith::DivUIOp>(loc, a, b).getResult();
+    } else {
+      return builder.create<mlir::arith::DivSIOp>(loc, a, b).getResult();
+    }
+  }
+}
+
+mlir::Value CodeGenPTOAS::VisitExpr_(const FloorModNode *op) {
+  // For positive inputs, floormod reduces to the usual remainder.
+  mlir::Location loc = builder.getUnknownLoc();
+  auto a = VisitExpr(op->a);
+  auto b = VisitExpr(op->b);
+  if (!a || !b) return mlir::Value();
+
+  if (op->dtype.is_float()) {
+    // floating-point remainder
+    return builder.create<mlir::arith::RemFOp>(loc, a, b).getResult();
+  } else {
+    if (op->dtype.is_uint()) {
+      return builder.create<mlir::arith::RemUIOp>(loc, a, b).getResult();
+    } else {
+      return builder.create<mlir::arith::RemSIOp>(loc, a, b).getResult();
+    }
+  }
+}
+
+static std::vector<mlir::Value> legalShape(CodeGenPTOAS *codegen, mlir::Location loc, const std::vector<PrimExpr> &shape) {
+  std::vector<mlir::Value> legalShape;
+  ICHECK(shape.size() <= 5) << "Shape with more than 5 dimensions is not supported.";
+  auto one = codegen->builder.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+  for (size_t i = 0; i < 5 - shape.size(); ++i) {
+    legalShape.push_back(one);
+  }
+  for (size_t i = 0; i < shape.size(); ++i) {
+    legalShape.push_back(CastVal(codegen->builder, loc, codegen->VisitExpr(shape[i]), codegen->builder.getIndexType(), false));
+  }
+  return legalShape;
+}
+
+static std::vector<mlir::Value> computeNDStrides(mlir::OpBuilder &builder, mlir::Location loc, const std::vector<mlir::Value> &shape) {
+  int n = shape.size();
+  std::vector<mlir::Value> strides(n);
+
+  if (n == 0) return strides;
+
+  mlir::Type indexType = builder.getIndexType();
+  mlir::Value one = builder.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+
+  strides[n - 1] = one;
+
+  for (int i = n - 2; i >= 0; --i) {
+    mlir::Value prevStride = strides[i + 1];
+    mlir::Value dimSize = shape[i + 1];
+    strides[i] = builder.create<mlir::arith::MulIOp>(loc, prevStride, dimSize).getResult();
+  }
+  return strides;
+}
+
+static std::vector<mlir::Value> makeSubviewSizes(mlir::OpBuilder &builder, mlir::Location loc, llvm::ArrayRef<int64_t> shape, size_t num) {
+  std::vector<mlir::Value> sizes;
+  size_t high = num - shape.size();
+  auto one = builder.create<mlir::arith::ConstantIndexOp>(loc, 1).getResult();
+  for (size_t i = 0; i < high; ++i) {
+    sizes.push_back(one);
+  }
+  for (size_t i = 0; i < shape.size(); ++i) {
+    auto val = builder.create<mlir::arith::ConstantIndexOp>(loc, shape[i]).getResult();
+    sizes.push_back(val);
+  }
+  return sizes;
+}
+
+mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
+  std::string op_name = Downcast<StringImm>(op->args[0])->value;
+  auto loc = builder.getUnknownLoc();
+  if (op_name.find("tl::ascend::copy") != std::string::npos) {
+    auto src_var = op->args[1].as<CallNode>()->args[1].as<VarNode>();
+    auto dst_var = op->args[2].as<CallNode>()->args[1].as<VarNode>();
+
+    auto src_offset = VisitExpr(op->args[1].as<CallNode>()->args[2]);
+    auto dst_offset = VisitExpr(op->args[2].as<CallNode>()->args[2]);
+
+    auto src_len = VisitExpr(op->args[1].as<CallNode>()->args[3]);
+    auto dst_len = VisitExpr(op->args[2].as<CallNode>()->args[3]);
+
+    auto src_type = op->args[1].as<CallNode>()->args[0].as<CallNode>()->dtype;
+    auto dst_type = op->args[2].as<CallNode>()->args[0].as<CallNode>()->dtype;
+
+    if (op_name.find("copy_gm_to_ub") != std::string::npos || op_name.find("copy_gm_to_l1") != std::string::npos) {
+      size_t op_arg_len = op->args.size();
+      long cols = eval(op->args[op_arg_len - 1]);
+      long rows = op_arg_len == 5 ? 1 : eval(op->args[op_arg_len - 2]);
+      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[src_var].sym.getType());
+      auto dtype = ptype.getElementType();
+      auto gbase = symbolTable[src_var].sym;
+      auto gshape = legalShape(this, loc, bufferTable[src_var].shape);
+      auto gviewtype = mlir::pto::TensorViewType::get(&context, gshape.size(), dtype);
+      ICHECK(gshape.size() != 0) << "gm shape cannot be empty.";
+      auto gstride = computeNDStrides(builder, loc, gshape);
+      auto gview = builder.create<mlir::pto::MakeTensorViewOp>(loc, gviewtype, gbase, gshape, gstride, nullptr).getResult();
+      auto subviewtype = mlir::pto::PartitionTensorViewType::get(&context, {rows, cols}, dtype);
+      auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+      std::vector<mlir::Value> offsets(gshape.size(), zero);
+      offsets.back() = CastVal(builder, loc, src_offset, builder.getIndexType(), false);
+      auto sizes = makeSubviewSizes(builder, loc, {rows, cols}, gshape.size());
+      auto gsubview = builder.create<mlir::pto::PartitionViewOp>(loc, subviewtype, gview, offsets, sizes).getResult();
+      auto restype = mlir::RankedTensorType::get({rows, cols}, dtype);
+      auto tload = builder.create<mlir::pto::TLoadOp>(loc, restype, gsubview, symbolTable[dst_var].sym);
+      return tload.getResult();
+    } else if (op_name.find("copy_ub_to_gm") != std::string::npos || op_name.find("copy_l0c_to_gm") != std::string::npos) {
+      size_t op_arg_len = op->args.size();
+      long cols = eval(op->args[op_arg_len - 1]);
+      long rows = op_arg_len == 5 ? 1 : eval(op->args[op_arg_len - 2]);
+      auto ptype = llvm::cast<mlir::pto::PtrType>(symbolTable[dst_var].sym.getType());
+      auto dtype = ptype.getElementType();
+      auto gbase = symbolTable[dst_var].sym;
+      auto gshape = legalShape(this, loc, bufferTable[dst_var].shape);
+      auto gviewtype = mlir::pto::TensorViewType::get(&context, gshape.size(), dtype);
+      ICHECK(gshape.size() != 0) << "gm shape cannot be empty.";
+      auto gstride = computeNDStrides(builder, loc, gshape);
+      auto gview = builder.create<mlir::pto::MakeTensorViewOp>(loc, gviewtype, gbase, gshape, gstride, nullptr).getResult();
+      auto subviewtype = mlir::pto::PartitionTensorViewType::get(&context, {rows, cols}, dtype);
+      auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+      std::vector<mlir::Value> offsets(gshape.size(), zero);
+      offsets.back() = CastVal(builder, loc, dst_offset, builder.getIndexType(), false);
+      auto sizes = makeSubviewSizes(builder, loc, {rows, cols}, gshape.size());
+      auto gsubview = builder.create<mlir::pto::PartitionViewOp>(loc, subviewtype, gview, offsets, sizes).getResult();
+      auto restype = mlir::RankedTensorType::get({rows, cols}, dtype);
+      builder.create<mlir::pto::TStoreOp>(loc, restype, symbolTable[src_var].sym, gsubview);
+      return mlir::Value();
+    } else if (op_name.find("copy_ub_to_ub") != std::string::npos) {
+      auto res = GetAsTile(op->args[2]);
+      auto src = GetAsTile(op->args[1]);
+      if (src_type == dst_type) {
+        auto dtype = llvm::cast<mlir::pto::TileBufType>(res.getType()).getElementType();
+        auto restype = mlir::RankedTensorType::get(mlir::cast<mlir::pto::TileBufType>(res.getType()).getShape(), dtype);
+        builder.create<mlir::pto::TMovOp>(loc, restype, src, res);
+      } else {
+        auto round = mlir::pto::RoundModeAttr::get(&context, mlir::pto::RoundMode::NONE);
+        builder.create<mlir::pto::TCvtOp>(loc, src, res, round);
+      }
+      return mlir::Value();
+    } else {
+      LOG(FATAL) << "Unsupported copy operation: " << op_name;
+    }
+  } else if (op_name == "trowexpandsub") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandSubOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
+  } else if (op_name == "trowexpandmul") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandMulOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
+  } else if (op_name == "trowexpanddiv") {
+    auto res = GetAsTile(op->args[1]);
+    auto lhs = GetAsTile(op->args[2]);
+    auto xpd = GetAsTile(op->args[3]);
+
+    auto origin = xpd;
+    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+      auto rmshape = xpdty.getShape();
+      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+      auto cmdtype = xpdty.getElementType();
+      auto cmspace = xpdty.getMemorySpace();
+      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
+      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
+      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
+      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
+      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
+      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+      xpd = cmtile;
+    }
+    builder.create<mlir::pto::TRowExpandDivOp>(loc, lhs, xpd, res);
+    if (origin != xpd) {
+      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+    }
+    return mlir::Value();
+  } else {
+    LOG(FATAL) << "Unsupported call operation: " << op_name;
+  }
+}
+
+void CodeGenPTOAS::UbShapeInputCheck(const AllocateNode *op) {
+  auto shape = buffer_shapes_[op->buffer_var];
   if (shape.size() > 3 || shape.size() == 0){
     ICHECK(false) << "Unsupported ubsize which is expected to be 1, 2 or 3";
   }
 }
 
-bool CodeGenTileLangPTOAS::ValidLayoutEnabled(const AllocateNode *op) {
-  auto shape = buffer_shapess_[op->buffer_var];
+bool CodeGenPTOAS::ValidLayoutEnabled(const AllocateNode *op) {
+  auto shape = buffer_shapes_[op->buffer_var];
   bool valid = false;
-  std::string type = getType(op->dtype);
-  int8_t typeSize = GetTypeLen(type);
+  int8_t typeSize = op->dtype.bits() / 8;
   if (tvm::tir::is_zero(tvm::truncmod(shape[1] * typeSize, 32))) {
     valid = false;
   } else {
@@ -1701,403 +1516,8 @@ bool CodeGenTileLangPTOAS::ValidLayoutEnabled(const AllocateNode *op) {
   return valid;
 }
 
-void CodeGenTileLangPTOAS::VisitStmt_(const AllocateNode *op) {
-  ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get()); // var_name
-  std::string scope = GetPtrStorageScope(op->buffer_var);
-  std::string type = getType(op->dtype);
-  const VarNode *buffer = op->buffer_var.as<VarNode>();
-
-  if (buffer_shapess_.count(op->buffer_var)) {
-    auto shape = buffer_shapess_[op->buffer_var];
-  } else {
-    ICHECK(false) << "Buffer_shape not found.";
-  }
-
-  /// Allocate PTO Tile Memory Address
-  auto print_buffer = [&](const std::string &pos) {
-    auto shape = buffer_shapess_[op->buffer_var];
-    std::vector<std::string> ub_data(5);
-    std::vector<std::string> l_data(3);
-    ub_data[0] = type;
-    l_data[0] = type;
-    if (pos == kAscendPtoScope + "TileUbData") {
-      UbShapeInputCheck(op);
-    }
-    PrimExpr target_expr;
-    bool found_by_name = false;
-    std::string target_var_name = op->buffer_var->name_hint;
-
-    for (const auto& pair : address_map_) {
-      Var var_key = pair.first;
-      if (var_key->name_hint == target_var_name) {
-        target_expr = pair.second;
-        found_by_name = true;
-        break;
-      }
-    }
-    this->PrintIndent();
-    // Allocate buffer
-    if (found_by_name) {
-      if (pos == kAscendPtoScope + "TileUbData") {
-        if (shape.size() == 2) {
-          ub_data[1] = PrintExpr(shape[0]);
-          ub_data[2] = PrintExpr(shape[1]);
-          auto valid = ValidLayoutEnabled(op);
-          if (!valid) {
-            stream << pos << "ND<" << type;
-            for (size_t i = 0; i < shape.size(); i++) {
-                stream << ", " << shape[i];
-            }
-          } else {
-            int8_t typeSize = GetTypeLen(type);
-            int8_t NDBlockSize = 32 / typeSize;
-            stream << pos << "ND<" << type;
-            stream << ", " << shape[0];
-            stream << ", " << tvm::floordiv(shape[1] + NDBlockSize - 1, NDBlockSize) * NDBlockSize;
-          }
-          // stream << "> " << vid << "(";
-          for (size_t i = 0; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-          }
-          stream << "> " << vid << ";\n";
-          ub_data[3] = PrintExpr(target_expr);
-          ub_data[4] = "Unapplied for tileUbDataDN";
-          ub_data_map_[vid] = ub_data;
-
-          this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << PrintExpr(target_expr) << ");\n";
-        } else if (shape.size() == 1) {
-          ub_data[1] = "1";
-          ub_data[2] = PrintExpr(shape[0]);
-          stream << pos << "ND<" << type << ", 1, " << shape[0] << ", 1, " << shape[0]<< "> " << vid << ";\n";
-          ub_data[3] = PrintExpr(target_expr);
-          ub_data[4] = "Unapplied for tileUbDataDN";
-          ub_data_map_[vid] = ub_data;
-          this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << PrintExpr(target_expr) << ");\n";
-        } else if (shape.size() == 3) {
-          ub_data[1] = PrintExpr(shape[1]);
-          ub_data[2] = PrintExpr(shape[2]);
-          ub_data_map_[vid] = ub_data;
-          int8_t bufferNum = shape[0].as<IntImmNode>()->value;
-          prefetch_n_stages_map_[vid] = std::pair<int, int> {bufferNum, 0};
-          auto valid = ValidLayoutEnabled(op);
-          if (!valid) {
-            stream << pos << "ND<" << type;
-            for (size_t i = 1; i < shape.size(); i++) {
-                stream << ", " << shape[i];
-            }
-          } else {
-            int8_t typeSize = GetTypeLen(type);
-            int8_t NDBlockSize = 32 / typeSize;
-            stream << pos << "ND<" << type;
-            stream << ", " << shape[0];
-            stream << ", " << tvm::floordiv(shape[1] + NDBlockSize - 1, NDBlockSize) * NDBlockSize;
-          }
-          for (size_t i = 1; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-          }
-          stream << "> " << vid << "[" << shape[0] << "];\n";
-          for (size_t i = 0; i < bufferNum; i++) {
-            this->PrintIndent();
-            stream << "TASSIGN(" << vid << "[" << i << "], " << PrintExpr(target_expr) << ");\n";
-          }
-        }
-      } else {
-        if (!(pos == kAscendPtoScope + "TileMatL1" && shape.size() == 3)) {
-        int dtype_bytes = op->dtype.bytes();
-        std::vector<PrimExpr> valid_shapes;
-        valid_shapes.reserve(2);
-        stream << pos << "<" << type;
-        int shape_value = shape[0].as<tvm::tir::IntImmNode>()->value;
-        if (shape_value * dtype_bytes % 32 == 0) {
-            valid_shapes.push_back(shape[0]);
-        } else {
-            valid_shapes.push_back(tvm::IntImm(shape[0].dtype(),
-            shape_value + (32 - shape_value * dtype_bytes % 32) / dtype_bytes));
-        }
-        valid_shapes.push_back(shape[1]);
-        for (size_t i = 0; i < valid_shapes.size(); i++) {
-            l_data[i + 1] = PrintExpr(valid_shapes[i]);
-            stream << ", " << valid_shapes[i];
-        }
-        for (size_t i = 0; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-        }
-        stream << "> " << vid << ";\n";
-         this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << PrintExpr(target_expr) << ");\n";
-        } else {
-          int8_t bufferNum = shape[0].as<IntImmNode>()->value;
-          prefetch_n_stages_map_[vid] = std::pair<int, int> {bufferNum, 0};
-          int dtype_bytes = op->dtype.bytes();
-          std::vector<PrimExpr> valid_shapes;
-          valid_shapes.reserve(shape.size()-1);
-          stream << pos << "<" << type;
-          int shape_value = shape[1].as<tvm::tir::IntImmNode>()->value;
-          if (shape_value * dtype_bytes % 32 == 0) {
-              valid_shapes.push_back(shape[1]);
-          } else {
-              valid_shapes.push_back(tvm::IntImm(shape[1].dtype(),
-              shape_value + (32 - shape_value * dtype_bytes % 32) / dtype_bytes));
-          }
-          valid_shapes.push_back(shape[2]);
-          for (size_t i = 0; i < valid_shapes.size(); i++) {
-              l_data[i + 1] = PrintExpr(valid_shapes[i]);
-              stream << ", " << valid_shapes[i];
-          }
-          for (size_t i = 1; i < shape.size(); i++) {
-              stream << ", " << shape[i];
-          }
-          stream << "> " << vid << "[" << shape[0] << "];\n";
-          for (size_t j = 0; j < bufferNum; j++) {
-            this->PrintIndent();
-            stream << "TASSIGN(" << vid << "[" << j << "], " << PrintExpr(target_expr) << ");\n";
-          }
-        }
-      }
-      l_data_map_[vid] = l_data;
-    } else {
-      if (address_offset_.find(String(pos)) == address_offset_.end()) {
-        address_offset_.Set(String(pos), 0);
-      }
-      if (pos == kAscendPtoScope + "TileUbData") {
-        if (shape.size() == 2) {
-
-          ub_data[1] = PrintExpr(shape[0]);
-          ub_data[2] = PrintExpr(shape[1]);
-          auto valid = ValidLayoutEnabled(op);
-          if (!valid) {
-            stream << pos << "ND<" << type;
-            for (size_t i = 0; i < shape.size(); i++) {
-                stream << ", " << shape[i];
-            }
-          } else {
-            int8_t typeSize = GetTypeLen(type);
-            int8_t NDBlockSize = 32 / typeSize;
-            stream << pos << "ND<" << type;
-            stream << ", " << shape[0];
-            stream << ", " << tvm::floordiv(shape[1] + NDBlockSize - 1, NDBlockSize) * NDBlockSize;
-          }
-          for (size_t i = 0; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-          }
-          stream << "> " << vid << ";\n";
-          ub_data[3] = DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)]));
-          ub_data[4] = "Unapplied for tileUbDataDN";
-          ub_data_map_[vid] = ub_data;
-          this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)])) << ");\n";
-          address_offset_.Set(
-          String(pos),
-          PrimExpr(int(op->ConstantAllocationSize() * op->dtype.bytes())) +
-          address_offset_[String(pos)]);
-        } else if (shape.size() == 1) {
-          ub_data[1] = "1";
-          ub_data[2] = PrintExpr(shape[0]);
-          stream << pos << "ND<" << type << ", 1, " << shape[0] << ", 1, " << shape[0]<< "> " << vid << ";\n";
-          ub_data[3] = DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)]));
-          ub_data[4] = "Unapplied for tileUbDataDN";
-          ub_data_map_[vid] = ub_data;
-          this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)])) << ");\n";
-          address_offset_.Set(
-              String(pos),
-              PrimExpr(int(op->ConstantAllocationSize() * op->dtype.bytes())) +
-                  address_offset_[String(pos)]);
-        } else if (shape.size() == 3) {
-          ub_data[1] = PrintExpr(shape[1]);
-          ub_data[2] = PrintExpr(shape[2]);
-          ub_data_map_[vid] = ub_data;
-          int8_t bufferNum = shape[0].as<IntImmNode>()->value;
-          prefetch_n_stages_map_[vid] = std::pair<int, int> {bufferNum, 0};
-          // if (j !=0 ) {this->PrintIndent();}
-          auto valid = ValidLayoutEnabled(op);
-          if (!valid) {
-            stream << pos << "ND<" << type;
-            for (size_t i = 1; i < shape.size(); i++) {
-                stream << ", " << shape[i];
-            }
-          } else {
-            int8_t typeSize = GetTypeLen(type);
-            int8_t NDBlockSize = 32 / typeSize;
-            stream << pos << "ND<" << type;
-            stream << ", " << shape[0];
-            stream << ", " << tvm::floordiv(shape[1] + NDBlockSize - 1, NDBlockSize) * NDBlockSize;
-          }
-          for (size_t i = 1; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-          }
-          stream << "> " << vid << "[" << shape[0] << "];\n";
-          for (size_t j = 0; j < bufferNum; j++) {
-            this->PrintIndent();
-            stream << "TASSIGN(" << vid << "[" << j << "], " << DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)])) << ");\n";
-            address_offset_.Set(
-                String(pos),
-                PrimExpr(int(op->ConstantAllocationSize() * op->dtype.bytes())) +
-                    address_offset_[String(pos)]);
-          }
-        }
-      } else {
-        if (!(pos == kAscendPtoScope + "TileMatL1" && shape.size() == 3)) {
-        int dtype_bytes = op->dtype.bytes();
-        std::vector<PrimExpr> valid_shapes;
-        valid_shapes.reserve(2);
-        stream << pos << "<" << type;
-        int shape_value = shape[0].as<tvm::tir::IntImmNode>()->value;
-        if (shape_value * dtype_bytes % 32 == 0) {
-            valid_shapes.push_back(shape[0]);
-        } else {
-            valid_shapes.push_back(tvm::IntImm(shape[0].dtype(),
-            shape_value + (32 - shape_value * dtype_bytes % 32) / dtype_bytes));
-        }
-        valid_shapes.push_back(shape[1]);
-        for (size_t i = 0; i < valid_shapes.size(); i++) {
-            l_data[i + 1] = PrintExpr(valid_shapes[i]);
-            stream << ", " << valid_shapes[i];
-        }
-        for (size_t i = 0; i < shape.size(); i++) {
-            stream << ", " << shape[i];
-        }
-        stream << "> " << vid << ";\n";
-         this->PrintIndent();
-          stream << "TASSIGN(" << vid << ", " << DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)])) << ");\n";
-          address_offset_.Set(
-              String(pos),
-              PrimExpr(int(op->ConstantAllocationSize() * op->dtype.bytes())) +
-                  address_offset_[String(pos)]);
-        } else {
-          int8_t bufferNum = shape[0].as<IntImmNode>()->value;
-          prefetch_n_stages_map_[vid] = std::pair<int, int> {bufferNum, 0};
-          int dtype_bytes = op->dtype.bytes();
-          std::vector<PrimExpr> valid_shapes;
-          valid_shapes.reserve(shape.size()-1);
-          stream << pos << "<" << type;
-          int shape_value = shape[1].as<tvm::tir::IntImmNode>()->value;
-          if (shape_value * dtype_bytes % 32 == 0) {
-              valid_shapes.push_back(shape[1]);
-          } else {
-              valid_shapes.push_back(tvm::IntImm(shape[1].dtype(),
-              shape_value + (32 - shape_value * dtype_bytes % 32) / dtype_bytes));
-          }
-          valid_shapes.push_back(shape[2]);
-          for (size_t i = 0; i < valid_shapes.size(); i++) {
-            l_data[i + 1] = PrintExpr(valid_shapes[i]);
-              stream << ", " << valid_shapes[i];
-          }
-          for (size_t i = 1; i < shape.size(); i++) {
-              stream << ", " << shape[i];
-          }
-          stream << "> " << vid << "[" << shape[0] << "];\n";
-          for (size_t j = 0; j < bufferNum; j++) {
-                        this->PrintIndent();
-            stream << "TASSIGN(" << vid << "[" << j << "], " << DEC_STR_TO_HEX_STR(PrintExpr(address_offset_[String(pos)])) << ");\n";
-            address_offset_.Set(
-                String(pos),
-                PrimExpr(int(op->ConstantAllocationSize() * op->dtype.bytes())) +
-                    address_offset_[String(pos)]);
-          }
-        }
-        l_data_map_[vid] = l_data;
-      }
-    }
-  };
-
-  if (scope == "wmma.matrix_a") {
-    print_buffer("TileLeft");
-  } else if (scope == "wmma.matrix_b") {
-    print_buffer("TileRight");
-  } else if (scope == "wmma.accumulator") {
-    print_buffer("TileAcc");
-  } else if (scope == "shared.dyn") {
-    print_buffer(kAscendPtoScope + "TileMatL1");
-  } else if (scope == "shared") {
-    print_buffer(kAscendPtoScope + "TileUbData");
-  }
-  this->PrintStmt(op->body);
-}
-
-inline void PrintConst(const FloatImmNode *op, std::ostream &os,
-                       CodeGenTileLangPTOAS *p) { // NOLINT(*)
-  // Type code is kBFloat
-  if (op->dtype.is_bfloat16()) {
-    os << "bfloat16_t";
-    os << '(' << std::scientific << op->value << 'f' << ')';
-    return;
-  }
-  // Type code is kFloat8_e5m2 or kE4M4Float
-  if (op->dtype.is_float8() || op->dtype.is_float4()) {
-    p->PrintType(op->dtype, os);
-    os << '(' << std::scientific << op->value << 'f' << ')';
-    return;
-  }
-  // Type code is kFloat
-  switch (op->dtype.bits()) {
-  case 64:
-  case 32: {
-    std::ostringstream temp;
-    if (std::isinf(op->value)) {
-      if (op->value < 0) {
-        temp << "-";
-      }
-      temp << ((op->dtype.bits() == 32) ? "CUDART_INF_F" : "CUDART_INF");
-      p->need_math_constants_h_ = true;
-    } else if (std::isnan(op->value)) {
-      temp << ((op->dtype.bits() == 32) ? "CUDART_NAN_F" : "CUDART_NAN");
-      p->need_math_constants_h_ = true;
-    } else {
-      temp << std::scientific << op->value;
-      if (op->dtype.bits() == 32)
-        temp << 'f';
-    }
-    p->MarkConst(temp.str());
-    os << temp.str();
-    break;
-  }
-  case 16: {
-    os << "half_t" << '(';
-    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
-    PrintConst(const_f32.get(), os, p);
-    os << ')';
-    break;
-  }
-  default:
-    LOG(FATAL) << "Bad bit-width for float: " << op->dtype << "\n";
-  }
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const FloatImmNode *op,
-                                       std::ostream &os) { // NOLINT(*)
-  PrintConst(op, os, this);
-}
-
-void CodeGenTileLangPTOAS::PreFunctionBody(const PrimFunc &f) {
-  int func_scope = this->BeginScope();
-  // this->PrintIndent();
-
-  ICHECK(this->para_.size() % 3 == 0)
-      << "CodeGenTileLangPTOAS: parameters should be in pairs of (var, "
-         "handle, dtype, shape0, shape1)";
-
-for (size_t i = 0; i < this->para_.size(); i += 3) {
-    copy_base_addr_map_.Set(String(this->para_[i + 1]), String(this->para_[i]));
-  }
-
-  this->EndScope(func_scope);
-}
-
-void CodeGenTileLangPTOAS::VisitExpr_(const SelectNode *op, std::ostream &os) {
-  auto condition = PrintExpr(op->condition);
-  auto true_value = PrintExpr(op->true_value);
-  auto false_value = PrintExpr(op->false_value);
-
-  os << "(" << condition << " ? "
-     << "" << true_value << " : " << false_value << ")";
-}
-
 static void ProcessHostInput(std::ostream &os, std::vector<std::string> &arg_names,
-                      std::vector<const tir::VarNode *> &shape_vars, bool add_args = true) {
+                      llvm::SmallVectorImpl<const tir::VarNode *> &shape_vars, bool add_args = true) {
   for (auto shape_var : shape_vars) {
     os << ", "
        << "int64_t " << shape_var->name_hint;
@@ -2106,104 +1526,108 @@ static void ProcessHostInput(std::ostream &os, std::vector<std::string> &arg_nam
   }
 }
 
-void CodeGenTileLangPTOAS::CallTilingInput(std::ostream &os, std::string func_name, std::vector<std::string> &tiling_args,
-  std::vector<const tir::VarNode*> &shape_vars)
-{
-
+static std::string ResolveCType(const DataType &dtype) {
+  if (dtype.is_float16()) {
+    return "half";
+  } else if (dtype.is_float()) {
+    return "float";
+  } else if (dtype.is_int() && dtype.bits() == 4) {
+    return "int4b_t";
+  } else if (dtype.is_int() && dtype.bits() == 8) {
+    return "int8_t";
+  } else if (dtype.is_int() && dtype.bits() == 16) {
+    return "int16_t";
+  } else if (dtype.is_int() && dtype.bits() == 32) {
+    return "int";
+  } else if (dtype.is_int() && dtype.bits() == 64) {
+    return "int64_t";
+  } else if (dtype.is_uint() && dtype.bits() == 8) {
+    return "uint8_t";
+  } else if (dtype.is_uint() && dtype.bits() == 16) {
+    return "uint16_t";
+  } else if (dtype.is_uint() && dtype.bits() == 32) {
+    return "uint32_t";
+  } else if (dtype.is_uint() && dtype.bits() == 64) {
+    return "uint64_t";
+  } else if (dtype.is_bfloat16()) {
+    return "bfloat16_t";
+  }
+  LOG(FATAL) << "Unsupported data type: " << dtype;
+  return "";
 }
 
-void CodeGenTileLangPTOAS::ProcessTilingInput(std::ostream &os, std::string func_name, std::vector<std::string> &tiling_args,
-  std::vector<const tir::VarNode*> &shape_vars)
-{
-
-}
-
-void CodeGenTileLangPTOAS::PrintHostFunc(const PrimFunc &f, const std::string &name,
-                                          std::ostringstream &os, std::string &core,
-                                          std::vector<const tir::VarNode *> &shape_vars) {
+static std::string GenHostFunc(const PrimFunc &func, std::string &name, std::string &core, llvm::SmallVectorImpl<const tir::VarNode *> &shapeVals) {
   std::vector<std::string> tiling_args;
   std::string tiling_func_name = name;
   // ProcessTilingInput(os, tiling_func_name, tiling_args, shape_vars);
 
+  std::ostringstream os;
+
   // launch kernel
-  os << "extern \"C\" __global__ AICORE void launch_kernel(";
+  os << "extern \"C\" void call(";
   std::vector<std::string> arg_names;
-  for (size_t i = 0; i < f->params.size(); ++i) { // params
-    auto v = f->params[i];
+  for (size_t i = 0; i < func->params.size(); ++i) { // params
+    auto v = func->params[i];
     if (i != 0) {
       os << ", ";
     }
     arg_names.push_back(v->name_hint);
     os << "__gm__ uint8_t *" << v->name_hint;
   }
-  ProcessHostInput(os, arg_names, shape_vars);
-  int func_scope = this->BeginScope();
-  os << ", uint64_t fftsAddr)\n{\n  ";
-  this->PrintIndent();
-  // template function
-  os << name << "(";
-  for (size_t i = 0; i < f->params.size(); ++i) { // params
-    auto v = f->params[i];
-    if (i != 0) {os << ",\n     ";}
-    os << "reinterpret_cast<__gm__ " << global_tensor_template[String(v->name_hint)].dtype
-    << " *>(" << v->name_hint << ")";
-  }
-  for (auto shape_var : shape_vars) {
-    os << ", " << shape_var->name_hint;
-  }
-  os << ", fftsAddr);\n}\n\n";
-
-
-  // call kernel
-  os << "extern \"C\" void call(";
-  for (size_t i = 0; i < f->params.size(); ++i) { // params
-    auto v = f->params[i];
-    if (i != 0) {
-      os << ", ";
-    }
-    // arg_names.push_back(v->name_hint);
-    os << "uint8_t *" << v->name_hint;
-  }
-  ProcessHostInput(os, arg_names, shape_vars, false);
+  ProcessHostInput(os, arg_names, shapeVals);
   os << ", void *stream)\n{\n  ";
   os << "  uint32_t fftsLen{0};\n  ";
   os << "  uint64_t fftsAddr{0};\n  ";
   os << "  rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);\n";
-  this->PrintIndent();
-  os << "  launch_kernel" << "<<<" << core << ", nullptr, stream>>>(";
+  // template function
+  os << name << "<<<" << core << ", nullptr, stream>>>(";
+  for (size_t i = 0; i < func->params.size(); ++i) { // params
+    auto v = func->params[i];
+    if (i != 0) {os << ",\n     ";}
+    os << "reinterpret_cast<__gm__ ";
+    if (func->buffer_map.count(v)) {
+      Buffer buf = func->buffer_map.at(v);
+      os << ResolveCType(buf->dtype);
+    } else {
+      os << ResolveCType(v->dtype);
+    }
+    os << " *>(" << v->name_hint << ")";
+  }
+  for (auto shape_var : shapeVals) {
+    os << ", " << shape_var->name_hint;
+  }
+  os << ");\n}\n\n";
+  // os << ", fftsAddr);\n}\n\n";
 
-  for (auto &arg_name : arg_names) {
-    os << arg_name;
-    if (arg_name != arg_names.back()) {
-      os << ", ";
-    }
-  }
-  if (!tiling_args.empty()) {
-    os << ", ";
-  }
-  for (auto &tiling_data : tiling_args) {
-    os << tiling_data;
-    if (tiling_data != tiling_args.back()) {
-      os << ", ";
-    }
-  }
-  os << ", fftsAddr);\n}\n";
-  this->EndScope(func_scope);
-  std::string content = os.str();
+  return os.str();
 }
 
-void CodeGenTileLangPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
+void CodeGenPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &func) {
+  CGC.AddFunction(gvar, func);
+  address_map_ = func->GetAttr<Map<Var, PrimExpr>>("address_map").value_or(Map<Var, PrimExpr>());
+  buffer_shapes_ = func->GetAttr<Map<Var, Array<PrimExpr>>>("buffer_shapess").value_or(Map<Var, Array<PrimExpr>>());
+
   builder.setInsertionPointToEnd(module->getBody());
   mlir::Location loc = builder.getUnknownLoc();
 
   llvm::SmallVector<mlir::Type, 4> argTypes;
+  llvm::SmallVector<const tir::VarNode *, 4> shapeVals;
 
   for (const auto &param : func->params) {
     // 1. Check buffer_map first for high-level buffer info
     if (func->buffer_map.count(param)) {
       Buffer buf = func->buffer_map.at(param);
-      mlir::Type elemType = resolvePrimitiveType(buf->dtype);
+      mlir::Type elemType = resolveArithType(buf->dtype);
       argTypes.push_back(mlir::pto::PtrType::get(&context, elemType));
+
+      for (size_t i = 0; i < buf->shape.size(); ++i) {
+        auto dim = buf->shape[i].as<VarNode>();
+        if (!dim)
+          continue;
+        if (std::find(shapeVals.begin(), shapeVals.end(), dim) == shapeVals.end()) {
+          shapeVals.push_back(dim);
+        }
+      }
     }
     // 2. Otherwise, look at the Var's type_annotation for nested pointers
     else if (param->type_annotation.defined()) {
@@ -2211,11 +1635,15 @@ void CodeGenTileLangPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &fu
     }
     // 3. Fallback to basic DataType
     else {
-      argTypes.push_back(resolvePrimitiveType(param->dtype));
+      argTypes.push_back(resolveArithType(param->dtype));
     }
   }
 
-  std::string funcName = gvar->name_hint.operator std::string();
+  for (auto dim : shapeVals) {
+    argTypes.push_back(resolveArithType(dim->dtype));
+  }
+
+  std::string funcName = gvar->name_hint.operator std::string() + "_kernel";
   auto funcType = builder.getFunctionType(argTypes, {});
   auto funcOp = builder.create<mlir::func::FuncOp>(loc, funcName, funcType);
 
@@ -2224,52 +1652,45 @@ void CodeGenTileLangPTOAS::AddFunction(const GlobalVar &gvar, const PrimFunc &fu
 
   for (size_t i = 0; i < func->params.size(); ++i) {
     auto param = func->params[i];
+    if (func->buffer_map.count(param)) {
+      Buffer buf = func->buffer_map.at(param);
+      // Buffer parameter
+      param = buf->data;
+      // Record buffer shape information
+      for (size_t i = 0; i < buf->shape.size(); ++i) {
+        auto dim = buf->shape[i];
+        bufferTable[buf->data.get()].shape.push_back(dim);
+      }
+    }
     mlir::Value mlir_param = entryBlock->getArgument(i);
-    symbolTable[param.get()] = mlir_param;
+    symbolTable[param.get()].sym = mlir_param;
   }
 
-  // this->VisitStmt(func->body);
+  for (size_t i = 0; i < shapeVals.size(); ++i) {
+    mlir::Value mlir_param = entryBlock->getArgument(func->params.size() + i);
+    symbolTable[shapeVals[i]].sym = mlir_param;
+  }
+
+  this->VisitStmt(func->body);
 
   if (entryBlock->empty() || !entryBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
     builder.create<mlir::func::ReturnOp>(loc);
   }
+
+  hostfn = GenHostFunc(func, funcName, core_num_, shapeVals);
 }
 
-void CodeGenTileLangPTOAS::AutoBarrierCodegen(const CallNode *op) {
-  this->PrintIndent();
-  std::string pipeline = "PIPE_ALL";
-  if (op->args.size() >= 1) {
-    if (auto pipeline_imm = op->args[0].as<StringImmNode>()) {
-      pipeline = pipeline_imm->value;
-    }
-  }
-  this->stream << "pipe_barrier(" << pipeline << ");\n";
+} // namespace codegen
+} // namespace tvm
+
+namespace tvm {
+namespace codegen {
+
+CodeGenTileLangPTOAS::CodeGenTileLangPTOAS(std::string platform) {
 }
 
-void CodeGenTileLangPTOAS::AutoFlagOpCodegen(const CallNode *op,
-                                                 std::string op_name) {
-  this->PrintIndent();
-
-  std::string event_type;
-  if (auto pipeline_imm = op->args[0].as<StringImmNode>()) {
-      event_type = pipeline_imm->value;
-  } else {
-      LOG(FATAL) << "Expected StringImm for event_type";
-      return;
-  }
-
-  size_t pos = event_type.find('_');
-
-  if (pos == 0 || pos == event_type.length() - 1) {
-      LOG(FATAL) << "Invalid event_type format: " << event_type;
-      return;
-  }
-  std::string src = event_type.substr(0, pos);
-  std::string dst = event_type.substr(pos + 1);
-
-  auto event_id = PrintExpr(op->args[1]);
-  this->stream << op_name << "(PIPE_" << src << ", " << "PIPE_" <<
-      dst << ", " << "EVENT_ID" << event_id << ");\n";
+std::string CodeGenTileLangPTOAS::Finish() {
+  return super::Finish();
 }
 
 } // namespace codegen
