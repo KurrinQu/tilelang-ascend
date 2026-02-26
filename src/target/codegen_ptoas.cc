@@ -702,6 +702,28 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
     return mlir::Value();
   }
 
+  if (op->op.same_as(tl::ascend_set_flag())) {
+    auto src_ = Downcast<StringImm>(op->args[0])->value;
+    auto dst_ = Downcast<StringImm>(op->args[1])->value;
+    auto eid_ = Downcast<IntImm>(op->args[2])->value;
+    auto src = mlir::pto::PipeAttr::get(&context, GetPipe(src_));
+    auto dst = mlir::pto::PipeAttr::get(&context, GetPipe(dst_));
+    auto eid = mlir::pto::EventAttr::get(&context, (mlir::pto::EVENT)eid_);
+    builder.create<mlir::pto::SetFlagOp>(loc, src, dst, eid);
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_wait_flag())) {
+    auto src_ = Downcast<StringImm>(op->args[0])->value;
+    auto dst_ = Downcast<StringImm>(op->args[1])->value;
+    auto eid_ = Downcast<IntImm>(op->args[1])->value;
+    auto src = mlir::pto::PipeAttr::get(&context, GetPipe(src_));
+    auto dst = mlir::pto::PipeAttr::get(&context, GetPipe(dst_));
+    auto eid = mlir::pto::EventAttr::get(&context, (mlir::pto::EVENT)eid_);
+    builder.create<mlir::pto::WaitFlagOp>(loc, src, dst, eid);
+    return mlir::Value();
+  }
+
   if (op->op.same_as(tl::ascend_wait_cross_flag())) {
     auto flag = Downcast<IntImm>(op->args[0])->value;
     auto pstr = Downcast<StringImm>(op->args[1])->value;
