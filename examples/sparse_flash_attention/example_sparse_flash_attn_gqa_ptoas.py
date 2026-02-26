@@ -199,9 +199,9 @@ def sparse_attention_fwd(
 
                     T.tile.exp(m_i_prev, m_i_prev)
 
-                    T.call_extern("handle", "trowexpandsub", acc_s_ub.access_ptr("w"), acc_s_ub.access_ptr("r"), m_i.access_ptr("r"))
-                    # for h_i in range(v_block):
-                    #     T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i])  # -
+                    # T.call_extern("handle", "trowexpandsub", acc_s_ub.access_ptr("w"), acc_s_ub.access_ptr("r"), m_i.access_ptr("r"))
+                    for h_i in range(v_block):
+                        T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i, 0])  # -
 
                     T.tile.exp(acc_s_ub, acc_s_ub)
 
@@ -211,9 +211,9 @@ def sparse_attention_fwd(
 
                     T.tile.add(sumexp, sumexp, sumexp_i_ub)
 
-                    T.call_extern("handle", "trowexpandmul", acc_o.access_ptr("w"), acc_o.access_ptr("r"), m_i_prev.access_ptr("r"))
-                    # for h_i in range(v_block):
-                    #     T.tile.mul(acc_o[h_i, :], acc_o[h_i, :], m_i_prev[h_i])
+                    # T.call_extern("handle", "trowexpandmul", acc_o.access_ptr("w"), acc_o.access_ptr("r"), m_i_prev.access_ptr("r"))
+                    for h_i in range(v_block):
+                        T.tile.mul(acc_o[h_i, :], acc_o[h_i, :], m_i_prev[h_i, 0])
 
                     T.copy(acc_s_ub, acc_s_half)
                     T.barrier_all()
@@ -239,11 +239,11 @@ def sparse_attention_fwd(
                     T.set_cross_flag("V", 4)
                     T.barrier_all()
 
-                T.call_extern("handle", "trowexpanddiv", acc_o.access_ptr("w"), acc_o.access_ptr("r"), sumexp.access_ptr("r"))
-                # for h_i in range(v_block):
-                #     T.barrier_all()
-                #     T.tile.div(acc_o[h_i, :], acc_o[h_i, :], sumexp[h_i])
-                #     T.barrier_all()
+                # T.call_extern("handle", "trowexpanddiv", acc_o.access_ptr("w"), acc_o.access_ptr("r"), sumexp.access_ptr("r"))
+                for h_i in range(v_block):
+                    T.barrier_all()
+                    T.tile.div(acc_o[h_i, :], acc_o[h_i, :], sumexp[h_i, 0])
+                    T.barrier_all()
 
                 T.copy(acc_o, acc_o_half)
                 T.barrier_all()
