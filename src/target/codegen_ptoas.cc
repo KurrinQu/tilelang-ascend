@@ -276,7 +276,6 @@ static void EmitScalarBinaryOp(CodeGenPTOAS *self, mlir::OpBuilder &builder, mli
     auto dtype = self->resolveArithType(call->args[2].as<CallNode>()->args[0]->dtype);
     auto stile = self->GetAsTile(call->args[2]);
     auto sidx = CastVal(builder, loc, self->VisitExpr(call->args[3]), builder.getIndexType(), false);
-    builder.create<mlir::pto::BarrierOp>(loc, mlir::pto::PipeAttr::get(&self->context, mlir::pto::PIPE::PIPE_ALL));
     rhs = builder.create<mlir::pto::TGetValOp>(loc, dtype, stile, sidx).getResult();
   } else {
     rhs = self->VisitExpr(call->args[2]);
@@ -559,6 +558,96 @@ void CodeGenPTOAS::VisitStmt_(const ForNode *op) {
   }
 }
 
+// Ensure a runtime condition value is converted to an i1 boolean MLIR value.
+// - If already i1, return as-is.
+// - If integer/index, compare != 0.
+// - If float, compare != 0.0 (ONE).
+static mlir::Value EnsureI1(mlir::OpBuilder &builder, mlir::Location loc, mlir::Value v) {
+  if (!v) return mlir::Value();
+  mlir::Type t = v.getType();
+  // already boolean
+  if (t.isInteger(1)) return v;
+
+  // index -> compare with 0
+  if (t.isIndex()) {
+    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, v, zero).getResult();
+  }
+
+  // integer types -> compare with zero
+  if (auto it = mlir::dyn_cast<mlir::IntegerType>(t)) {
+    auto zeroAttr = builder.getIntegerAttr(it, 0);
+    auto zero = builder.create<mlir::arith::ConstantOp>(loc, it, zeroAttr).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, v, zero).getResult();
+  }
+
+  // float types -> compare with 0.0 (ONE predicate)
+  if (auto ft = mlir::dyn_cast<mlir::FloatType>(t)) {
+    auto zeroF = mlir::FloatAttr::get(ft, 0.0);
+    auto zero = builder.create<mlir::arith::ConstantOp>(loc, ft, zeroF).getResult();
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::ONE, v, zero).getResult();
+  }
+
+  // fallback: attempt to cast to index then compare
+  if (auto casted = builder.createOrFold<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), v)) {
+    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, casted, zero).getResult();
+  }
+
+  return v;
+}
+
+// Lower IfThenElse (tir::IfThenElseNode) to scf.if
+void CodeGenPTOAS::VisitStmt_(const IfThenElseNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+
+  // Evaluate condition and canonicalize to i1
+  mlir::Value cond = VisitExpr(op->condition);
+  cond = EnsureI1(builder, loc, cond);
+  if (!cond) {
+    LOG(FATAL) << "Failed to generate condition for IfThenElse.";
+  }
+
+  bool hasElse = op->else_case.defined();
+
+  // Create scf.if with/without else region (no results)
+  auto ifOp = builder.create<mlir::scf::IfOp>(loc, /*resultTypes=*/llvm::ArrayRef<mlir::Type>{}, cond, hasElse);
+
+  // Then region
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    // scf.if may already create an empty block for the then-region.
+    // Only emplace a block when the region is empty; otherwise use the existing front().
+    auto &thenRegion = ifOp.getThenRegion();
+    if (thenRegion.empty()) {
+      thenRegion.emplaceBlock();
+    }
+    auto &thenBlock = thenRegion.front();
+    builder.setInsertionPointToStart(&thenBlock);
+    // Emit then body
+    VisitStmt(op->then_case);
+    // ensure terminator
+    if (thenBlock.empty() || !thenBlock.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
+  }
+
+  // Else region (if present)
+  if (hasElse) {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto &elseRegion = ifOp.getElseRegion();
+    if (elseRegion.empty()) {
+      elseRegion.emplaceBlock();
+    }
+    auto &elseBlock = elseRegion.front();
+    builder.setInsertionPointToStart(&elseBlock);
+    VisitStmt(op->else_case.value());
+    if (elseBlock.empty() || !elseBlock.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
+  }
+}
+
 mlir::Value CodeGenPTOAS::VisitExpr_(const BufferLoadNode *op) {
   mlir::Location loc = builder.getUnknownLoc();
   std::string scope = op->buffer.scope();
@@ -702,6 +791,28 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
     return mlir::Value();
   }
 
+  if (op->op.same_as(tl::ascend_set_flag())) {
+    auto src_ = Downcast<StringImm>(op->args[0])->value;
+    auto dst_ = Downcast<StringImm>(op->args[1])->value;
+    auto eid_ = Downcast<IntImm>(op->args[2])->value;
+    auto src = mlir::pto::PipeAttr::get(&context, GetPipe(src_));
+    auto dst = mlir::pto::PipeAttr::get(&context, GetPipe(dst_));
+    auto eid = mlir::pto::EventAttr::get(&context, (mlir::pto::EVENT)eid_);
+    builder.create<mlir::pto::SetFlagOp>(loc, src, dst, eid);
+    return mlir::Value();
+  }
+
+  if (op->op.same_as(tl::ascend_wait_flag())) {
+    auto src_ = Downcast<StringImm>(op->args[0])->value;
+    auto dst_ = Downcast<StringImm>(op->args[1])->value;
+    auto eid_ = Downcast<IntImm>(op->args[2])->value;
+    auto src = mlir::pto::PipeAttr::get(&context, GetPipe(src_));
+    auto dst = mlir::pto::PipeAttr::get(&context, GetPipe(dst_));
+    auto eid = mlir::pto::EventAttr::get(&context, (mlir::pto::EVENT)eid_);
+    builder.create<mlir::pto::WaitFlagOp>(loc, src, dst, eid);
+    return mlir::Value();
+  }
+
   if (op->op.same_as(tl::ascend_wait_cross_flag())) {
     auto flag = Downcast<IntImm>(op->args[0])->value;
     auto pstr = Downcast<StringImm>(op->args[1])->value;
@@ -715,7 +826,7 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
         LOG(FATAL) << "Unknown source scope for wait_cross_flag: " << this->source_scope;
       }
     } else {
-      LOG(FATAL) << "Specifying pipe name in wait_cross_flag is not supported yet.";
+      pipe = GetPipe(pstr);
     }
     builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
     if (this->source_scope == "CUBE") {
