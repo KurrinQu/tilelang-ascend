@@ -431,6 +431,9 @@ public:
 
     Stmt VisitStmt_(const EvaluateNode *op) final {
         auto call_node_ = op->value.as<CallNode>();
+        if (!call_node_) {
+          return StmtMutator::VisitStmt_(op);
+        }
         std::string api_name = "";
         if (call_node_ && call_node_->args[0].as<StringImmNode>()) {
             api_name = call_node_->args[0].as<StringImmNode>()->value;
@@ -454,7 +457,7 @@ public:
         }
         // judgement 2
         int32_t judge2 = -1;
-        for (int i = 1; i < call_node_->args.size(); i++) {
+        for (int i = 0; i < call_node_->args.size(); i++) {
             if (auto inter_node = call_node_->args[i].as<CallNode>()) {
                 auto buf_name = Downcast<Var>(inter_node->args[1]);
                 judge2 = checkBufferScope(buf_name);

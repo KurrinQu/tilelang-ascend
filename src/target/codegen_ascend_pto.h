@@ -53,7 +53,10 @@ public:
 
   void UnaryVecOpCodegen(const CallNode *op, const std::string& op_name);
   void ScalarOpCodegen(const CallNode *op, const std::string& op_name);
+  void AxpyCodegen(const CallNode *op);
+  void BinaryVecClampMaxMinOpsCodegen(const CallNode *op, const std::string& op_name);
   void BinaryVecClampOpsCodegen(const CallNode *op, const std::string& op_name);
+  void SigmoidCodegen(const CallNode *op, const std::string& op_type);
   void CastCodegen(const CallNode *op, const std::string& op_type);
   void ReduceOpCodegen(const CallNode *op);
 
@@ -73,7 +76,7 @@ private:
 
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangAscendPto *p);
-  
+
   void BinaryVecOpCodegen(const CallNode* op, const std::string& op_name);
 
   void BinaryVecOpsCodegen(const CallNode* op, const std::string& op_name);
@@ -81,6 +84,10 @@ private:
   void CallExternCodegen(const CallNode *op);
 
   void GemmV0Codegen(const CallNode *op);
+
+  void GemmV1Codegen(const CallNode *op);
+  
+  void SyncAllCodegen(const CallNode *op);
 
   void PipeBarrierCodegen(const CallNode *op);
 
@@ -111,6 +118,22 @@ private:
   void CompareCodegen(const CallNode *op, const std::string &op_name);
 
   void CompareScalarCodegen(const CallNode *op, const std::string &op_name);
+
+  void TshCodegen(const CallNode *op, const std::string &op_name);
+
+  void ArithProgressionCodegen(const CallNode *op, const std::string &op_name);
+
+  void PrintfOpCodegen(const CallNode *op, const std::string& op_name);
+
+  void DumpTensorCodegen(const CallNode *op, const std::string &op_name);
+  
+  void BroadcastOpCodegen(const CallNode *op);
+
+  void SelectCodegen(const CallNode *op);
+
+  void SetDeqScaleCodegen(const CallNode *op);
+
+  std::vector<std::string> GetGlobalTensorShapes(const CallNode *op, std::string tensor_addr);
 
   std::string PrintBufferOffset(const CallNode *op);
   void UbShapeInputCheck(const AllocateNode *op);
@@ -149,6 +172,7 @@ private:
 
   Map<Var, PrimExpr> address_map_;
   Map<Var, Array<PrimExpr>> buffer_shapess_;
+  Map<Var, PrimExpr> buffer_versions_;
 
   Map<Var, PrimExpr> tiling_map_;
   Array<Var> var_sequence_;
@@ -157,11 +181,24 @@ private:
 
   Map<String, String> copy_tmplte_map_;
   Map<String, String> copy_base_addr_map_;
-  
+
   std::map<std::string, std::vector<std::string>> ub_data_map_;
   std::map<std::string, std::vector<std::string>> l_data_map_;
   std::map<std::string, std::string> for_num_map_;
   std::map<std::string, std::pair<int, int>> prefetch_n_stages_map_;
+
+  std::unordered_map<std::string, std::string> dtype_map = {
+        {"int8", "char"},
+        {"int32", "int"},
+        {"int8x4", "int32_t"},
+        {"int32x4", "int32x4"},
+        {"float16", "half"},
+        {"float32", "float"},
+        {"float64", "double"},
+        {"float16x4", "float16x4"},
+        {"bfloat16x4", "bfloat16x4"},
+        {"float32x4", "float32x4"},
+        {"float32x16", "float32x16"}};
   
   struct global_tensor{
     String shape_type;

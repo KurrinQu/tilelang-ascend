@@ -22,7 +22,7 @@ namespace codegen {
 
 class CodeGenTileLangAscend final : public CodeGenC {
 public:
-  CodeGenTileLangAscend();
+  CodeGenTileLangAscend(std::string platform);
   std::string Finish();
   // override behavior
   void PrintFuncPrefix(std::ostream &os) final;
@@ -156,11 +156,29 @@ private:
 
   void SigmoidCodegen (const CallNode *op, const std::string& op_name);
 
+  void ClampMaxMinCodegen (const CallNode *op);
+
   void ClampCodegen (const CallNode *op);
 
   void RoundCodegen (const CallNode *op, const std::string& op_name);
 
   void ReinterpretCastCodegen (const CallNode *op);
+
+  void CreateSubExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateAbsExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateMinsExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void CreateReduceSumExperimentCodegen(const CallNode *op, const std::string& op_name);
+
+  void GatherMaskExperimentCodegen(const CallNode *op);
+
+  void FillExperimentCodegen(const CallNode *op);
+
+  void SumExperimentCodegen(const CallNode *op);
+
+  void CreateDatacacheExperimentCodegen(const CallNode *op);
 
 private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
@@ -207,6 +225,8 @@ private:
   Map<String, PrimExpr> address_offset_;
 
   bool use_swizzle_{false};
+
+  std::string platform_;
 };
 
 } // namespace codegen

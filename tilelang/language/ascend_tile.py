@@ -897,6 +897,9 @@ def wholereducemax(
     srcrepstride: PrimExpr,
     ReduceOrder: str = "ORDER_VALUE_INDEX",
 ):
+    """
+    Warning:Currently, this implementation does not support pto target
+    """
     return _wholereduce(
         "max", dst, src, mask, repeattimes, dstrepstride, srcblkstride, srcrepstride, ReduceOrder
     )
@@ -912,6 +915,9 @@ def wholereducemin(
     srcrepstride: PrimExpr,
     ReduceOrder: str = "ORDER_VALUE_INDEX",
 ):
+    """
+    Warning:Currently, this implementation does not support pto target
+    """
     return _wholereduce(
         "min", dst, src, mask, repeattimes, dstrepstride, srcblkstride, srcrepstride, ReduceOrder
     )
@@ -920,6 +926,9 @@ def wholereducemin(
 def wholereducesum(
     dst: Buffer, src: Buffer, mask: PrimExpr, repeattimes: PrimExpr, dstrepstride: PrimExpr, srcblkstride: PrimExpr, srcrepstride: PrimExpr
 ):
+    """
+    Warning:Currently, this implementation does not support pto target
+    """
     return _wholereduce("sum", dst, src, mask, repeattimes, dstrepstride, srcblkstride, srcrepstride)
 
 
@@ -1022,6 +1031,8 @@ def block_reduce_max(
     This intrinsic invokes the underlying implementation to find the maximum
     value within data blocks from the source buffer.
 
+    Warning:Currently, this implementation does not support pto target
+
     Args:
         dst: The destination buffer where the results will be stored.
         src: The source buffer containing the data to be reduced.
@@ -1061,6 +1072,8 @@ def block_reduce_min(
     This intrinsic invokes the underlying implementation to find the minimum
     value within data blocks from the source buffer.
 
+    Warning:Currently,this implementation does not support pto target
+
     Args:
         dst: The destination buffer where the results will be stored.
         src: The source buffer containing the data to be reduced.
@@ -1099,6 +1112,8 @@ def block_reduce_sum(
 
     This intrinsic invokes the underlying implementation to calculate the sum
     of elements within data blocks from the source buffer.
+
+    Warning:Currently,this implementation does not support pto target
 
     Args:
         dst: The destination buffer where the results will be stored.
@@ -1321,13 +1336,14 @@ def pow(dst: Buffer, src0: Buffer, src1: Buffer, tmp: Buffer):
     )
 
 
-def bitwise_xor(dst: Buffer, src0: Buffer, src1: Buffer):
+def bitwise_xor(dst: Buffer, src0: Buffer, src1: Buffer, tmp: Buffer):
     """Performs element-wise bitwise XOR operation: dst = src0 ^ src1.
 
     Args:
         dst: The destination buffer where the result will be stored.
         src0: The first source operand buffer.
         src1: The second source operand buffer.
+        tmp: A temporary buffer used for intermediate calculations.
 
     Returns:
         A TVM intrinsic call that performs the bitwise XOR operation.
@@ -1338,11 +1354,24 @@ def bitwise_xor(dst: Buffer, src0: Buffer, src1: Buffer):
         dst.access_ptr("w"),
         src0.access_ptr("r"),
         src1.access_ptr("r"),
+        tmp.access_ptr("w")
     )
 
 
 def clamp_max(out: Buffer, buffer: Buffer, tmp: Buffer, scalar_value: PrimExpr, count: PrimExpr):
+    """_summary_
+    Clip tensor elements to no more than scalar_value, replace elements larger than scalar_value with scalar_value, 
+    keep original values for elements less than or equal to scalar_value
+    Args:
+        out: The destination buffer where the result will be stored.
+        buffer: The first source operand buffer.
+        tmp: The second source operand buffer.
+        scalar_value: The max scalar value
+        count: The size of tensor out
 
+    Returns:
+        A TVM intrinsic call that performs the clamp_max operation.
+    """
     return tir.call_intrin(
         "handle",
         tir.op.Op.get(f"tl.ascend_clamp_max"),
@@ -1355,7 +1384,19 @@ def clamp_max(out: Buffer, buffer: Buffer, tmp: Buffer, scalar_value: PrimExpr, 
     )
 
 def clamp_min(out: Buffer, buffer: Buffer, tmp: Buffer, scalar_value: PrimExpr, count: PrimExpr):
+    """
+    Clip tensor elements to no less than v, replace elements smaller than scalar_value with scalar_value, 
+    keep original values for elements greater than or equal to scalar_value
+    Args:
+        out: The destination buffer where the result will be stored.
+        buffer: The first source operand buffer.
+        tmp: The second source operand buffer.
+        scalar_value: The min scalar value
+        count: The size of tensor out
 
+    Returns:
+        A TVM intrinsic call that performs the clamp_min operation.
+    """
     return tir.call_intrin(
         "handle",
         tir.op.Op.get(f"tl.ascend_clamp_min"),
@@ -1366,6 +1407,33 @@ def clamp_min(out: Buffer, buffer: Buffer, tmp: Buffer, scalar_value: PrimExpr, 
         scalar_value,
         count
     )
+
+def clamp(out: Buffer, buffer: Buffer, tmp: Buffer, min_scalar: PrimExpr, max_scalar: PrimExpr, count: PrimExpr):
+    """
+    Clip tensor elements to [min_scalar, max_scalar] range, replace out-of-bounds values with boundary values
+    Args:
+        out: The destination buffer where the result will be stored.
+        buffer: The first source operand buffer.
+        tmp: The second source operand buffer.
+        min_scalar: The min scalar value
+        max_scalar: The max scalar value
+        count: The size of tensor out
+
+    Returns:
+        A TVM intrinsic call that performs the clamp operation.
+    """
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_clamp"),
+        f"Clamp<{_dtype(buffer)}>",
+        out.access_ptr("w"),
+        buffer.access_ptr("r"),
+        tmp.access_ptr("r"),
+        min_scalar,
+        max_scalar,
+        count
+    )
+    
 
 def round(out: Buffer, buffer: Buffer, tmp: Buffer, count: PrimExpr):
 
@@ -1440,3 +1508,221 @@ def broadcast(dst: Buffer, src: Buffer, tmp: Buffer):
         *dst_shape,
         *src_shape,
     )
+
+def sub_experiment(dst: Buffer, src0: Buffer, src1: Buffer, count: PrimExpr):
+    """Performs element-wise subtraction(with count function): dst = src0 - src1.
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src0: The base buffer.
+        scr1: The exponent buffer.
+        count: The number of elements to process.
+    """
+
+    size_0 = math.prod(src0.shape)
+    size_1 = math.prod(src1.shape)
+    size_2 = math.prod(dst.shape)
+    assert size_0 == size_1 == size_2, "size must be same"
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_sub_experiment"),
+        dst.access_ptr("w"),
+        src0.access_ptr("r"),
+        src1.access_ptr("r"),
+        count,
+    )
+
+def abs_experiment(dst: Buffer, src: Buffer, count: PrimExpr):
+    """Performs element-wise absolute value(with count function): dst = abs(src0).
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src: The base buffer.
+        count: The number of elements to process.
+    """
+
+    size_0 = math.prod(src.shape)
+    size_2 = math.prod(dst.shape)
+    assert size_0 == size_2, "size must be same"
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_abs_experiment"),
+        dst.access_ptr("w"),
+        src.access_ptr("r"),
+        count,
+    )
+
+def mins_experiment(dst: Buffer, src: Buffer, scalarValue: PrimExpr, count: PrimExpr):
+    """Performs comparison of each element in the tensor with a scalar.
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src: The base buffer.
+        scalarValue: The scalar for comparison.
+        count: The number of elements to process.
+    """
+    size_0 = math.prod(src.shape)
+    size_2 = math.prod(dst.shape)
+    assert size_0 == size_2, "size must be same"
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_mins_experiment"),
+        dst.access_ptr("w"),
+        src.access_ptr("r"),
+        scalarValue,
+        count,
+    )
+
+def reduce_sum_experiment(dst: Buffer, src: Buffer, sharedtmp: Buffer, count: PrimExpr):
+    """Performs summation of all input data.
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src: The base buffer.
+        sharedtmp: Used to store intermediate results during instruction execution.
+        count: The number of elements to process.
+    """
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_reducesum_experiment"),
+        dst.access_ptr("w"),
+        src.access_ptr("r"),
+        sharedtmp.access_ptr("r"),
+        count,
+    )
+
+def reduce_sum_mask_experiment(
+    dst: Buffer, src: Buffer, sharedtmp: Buffer, mask: PrimExpr, repeatTime: PrimExpr, srcRepStride: PrimExpr
+    ):
+    """Performs summation of all input data(High-dimensional tensor slicing and computation).
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src: The base buffer.
+        sharedtmp: Used to store intermediate results during instruction execution.
+        mask: Used to control the elements participating in the computation within each iteration.
+        repeatTime: Number of iterations.
+        srcRepStride: The address step size of the source operand between adjacent iterations.
+    """
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_reducesum_mask_experiment"),
+        dst.access_ptr("w"),
+        src.access_ptr("r"),
+        sharedtmp.access_ptr("r"),
+        mask,
+        repeatTime,
+        srcRepStride,
+    )
+
+def gathermask_experiment(
+    dst: Buffer, src0: Buffer, src1Pattern: Buffer, reduceMode: bool, mask: PrimExpr, GatherMaskParams: List[int], rsvdCnt: PrimExpr
+    ):
+    """Performs a gather mask operation(User-defined mode).
+
+    This intrinsic invokes the underlying implementation to perform a gather mask
+    operation based on the source data and the specified count.
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src0: The source buffer containing the input data.
+        src1Pattern: Selects elements from the source operand according to the binary values
+                     corresponding to the user-defined input Tensor values and writes them to the destination operand.
+        reduceMode: Used to select the mask parameter mode:
+                    - "False": Normal mode.
+                    - "True": Counter mode.
+        mask: Used to control the elements participating in the computation within each iteration.
+        GatherMaskParams: A data structure that controls the address step size of operands:
+                    - "src0BlockStride": Used to set the address step size between different DataBlocks of src0 in the same iteration, in units of DataBlock.
+                    - "repeatTime": Number of iterations.
+                    - "scr0RepeatStride": Used to set the address step size of src0 between adjacent iterations, in units of DataBlock.
+                    - "scr1RepeatStride": Used to set the address step size of src1 between adjacent iterations, in units of DataBlock.
+        rsvdCnt: The count of elements retained after filtering by this instruction, corresponding to the number of valid elements in dstLocal.
+    """
+
+    src0BlockStride = GatherMaskParams[0]
+    repeatTime = GatherMaskParams[1]
+    scr0RepeatStride = GatherMaskParams[2]
+    scr1RepeatStride = GatherMaskParams[3]
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get(f"tl.ascend_gather_mask_experiment"),
+        f"GatherMask_experiment<{_dtype(dst)}>",
+        dst.access_ptr("w"),
+        src0.access_ptr("r"),
+        src1Pattern.access_ptr("r"),
+        reduceMode,
+        mask,
+        src0BlockStride,
+        repeatTime,
+        scr0RepeatStride,
+        scr1RepeatStride,
+        rsvdCnt,
+    )
+
+def fill_experiment(
+    dst: Buffer, value: PrimExpr, mask: List[int], repeatTimes: PrimExpr, dstBlockStride: PrimExpr, dstRepeatStride: PrimExpr
+    ):
+    """Fill a buffer or buffer region with a specified value(High-dimensional tensor slicing and computation).
+
+    Args:
+        dst: Either a TVM buffer or buffer region to be filled.
+        value: The value to fill the buffer with.
+        mask: Used to control the elements participating in the computation within each iteration.
+        repeatTime: Number of iterations.
+        dstBlockStride: Address stride between different DataBlocks for the vector destination operand within a single iteration.
+        dstRepeatStride: Address stride of the same DataBlock for the vector destination operand between adjacent iterations.
+    """
+
+    mask0 = mask[0]
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_fill_experiment"),
+        f"Fill_experiment<{_dtype(dst)}>",
+        dst.access_ptr("w"),
+        value,
+        mask0,
+        repeatTimes,
+        dstBlockStride,
+        dstRepeatStride,
+    )
+
+def sum_experiment(dst: Buffer, src: Buffer, sumParams: List[int]):
+    """Sum elements along the last dimension (high-level API).
+
+    Args:
+        dst: The destination buffer where the result will be stored.
+        src: The base buffer.
+        outter: Get the sum of elements over the last dimension.
+        inner: Represents the number of padded elements along the inner axis of the input data,
+               inner * sizeof(T) must be an integer multiple of 32 bytes.
+        n: Represents the actual number of elements along the inner axis of the input data.
+    """
+    
+    outter = sumParams[0]
+    inner = sumParams[1]
+    n = sumParams[2]
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_sum_experiment"),
+        f"Sum_experiment<{_dtype(dst)}>",
+        dst.access_ptr("w"),
+        src.access_ptr("r"),
+        outter,
+        inner,
+        n,
+    )
+
+def datacachecleanandinvalid_experiment(dst: Buffer, CacheLine: str, DcciDst: str):
+
+    return T.call_intrin(
+            "handle",
+            tir.op.Op.get(f"tl.ascend_datacachecleanandinvalid_experiment"),
+            f"AscendC::DataCacheCleanAndInvalid<{_dtype(dst)}, AscendC::CacheLine::{CacheLine}, AscendC::DcciDst::{DcciDst}>",
+            dst.access_ptr("w"),
+        )  

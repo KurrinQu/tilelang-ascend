@@ -59,9 +59,9 @@ TVM_DLL const Op &ascend_muls();
 
 TVM_DLL const Op &ascend_divs();
 
-// TVM_DLL const Op &ascend_maxs();
+TVM_DLL const Op &ascend_maxs();
 
-// TVM_DLL const Op &ascend_mins();
+TVM_DLL const Op &ascend_mins();
 
 TVM_DLL const Op &ascend_compare();
 
@@ -197,7 +197,27 @@ TVM_DLL const Op &ascend_clamp_max();
 
 TVM_DLL const Op &ascend_clamp_min();
 
+TVM_DLL const Op &ascend_clamp();
+
 TVM_DLL const Op &ascend_round();
+
+TVM_DLL const Op &ascend_sub_experiment();
+
+TVM_DLL const Op &ascend_abs_experiment();
+
+TVM_DLL const Op &ascend_mins_experiment();
+
+TVM_DLL const Op &ascend_reducesum_experiment();
+
+TVM_DLL const Op &ascend_reducesum_mask_experiment();
+
+TVM_DLL const Op &ascend_gather_mask_experiment();
+
+TVM_DLL const Op &ascend_fill_experiment();
+
+TVM_DLL const Op &ascend_sum_experiment();
+
+TVM_DLL const Op &ascend_datacachecleanandinvalid_experiment();
 } // namespace tl
 } // namespace tvm
 
