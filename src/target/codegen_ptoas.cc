@@ -1037,7 +1037,13 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
         LOG(FATAL) << "Unsupported reduce operation: " << opname;
       }
     } else {
-      LOG(FATAL) << "Unsupported reduce dimension: " << rdim;
+      if (opname.find("reduce_sum") != std::string::npos) {
+        builder.create<mlir::pto::TColSumOp>(loc, src, tmp, res);
+      } else if (opname.find("reduce_max") != std::string::npos) {
+        builder.create<mlir::pto::TColMaxOp>(loc, src, res);
+      } else {
+        LOG(FATAL) << "Unsupported reduce operation: " << opname;
+      }
     }
     if (origin != res) {
       builder.create<mlir::pto::TReshapeOp>(loc, res, origin);
