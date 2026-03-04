@@ -138,12 +138,12 @@ def sparse_attention_fwd(
                         T.set_flag("MTE2", "M", 1)
                         T.wait_flag("MTE2", "M", 1)
 
-                        T.gemm_v0(q_l1, kv_l1, acc_s_l0c, transpose_B=True, init=True)
+                        T.gemm_v0(kv_l1, q_l1, acc_s_l0c, transpose_B=True, init=True)
                         # T.barrier_all()
                         T.set_flag("M", "FIX", 2)
                         T.wait_flag("M", "FIX", 2)
 
-                        T.copy(acc_s_l0c, workspace_2[cid + (workspace_block_num * pingpang), 0:heads_per_group, 0:BI])
+                        T.copy(acc_s_l0c, workspace_2[cid + (workspace_block_num * pingpang), 0:BI, 0:heads_per_group])
                         # T.barrier_all()
                         T.set_cross_flag("FIX", 1)
 
@@ -206,7 +206,7 @@ def sparse_attention_fwd(
 
                         T.wait_cross_flag(1, "MTE2")
                         T.copy(
-                            workspace_2[cid + (workspace_block_num * pingpang), vid * v_block:vid * v_block + v_block, :],
+                            workspace_2[cid + (workspace_block_num * pingpang), :, vid * v_block:vid * v_block + v_block],
                             acc_s_ub_)
                         # T.barrier_all()
                         T.set_flag("MTE2", "V", 5)
