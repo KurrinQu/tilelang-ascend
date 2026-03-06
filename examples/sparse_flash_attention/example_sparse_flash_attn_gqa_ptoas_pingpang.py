@@ -55,9 +55,9 @@ def sparse_attention_fwd(
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, heads, dim]
     indices_shape = [batch, seq_len, kv_group, topk]
-    workspace_1_shape = [workspace_block_num, BI, D]
-    workspace_2_shape = [workspace_block_num, H_per_block, BI]
-    workspace_4_shape = [workspace_block_num, H_per_block, D]
+    workspace_1_shape = [workspace_block_num * 2, BI, D]
+    workspace_2_shape = [workspace_block_num * 2, H_per_block, BI]
+    workspace_4_shape = [workspace_block_num * 2, H_per_block, D]
 
 
     @T.prim_func
@@ -126,146 +126,170 @@ def sparse_attention_fwd(
 
             with T.Scope("C"):
                 T.copy(Q[b_i, s_i, H0:H1, :D], q_l1)
-                T.barrier_all()
-                for _ in T.serial(NI):
-                    T.wait_cross_flag(0)
-                    T.barrier_all()
-                    T.copy(workspace_1[cid, 0:BI, 0:D], kv_l1)
-                    T.barrier_all()
+                # T.barrier_all()
+                for i in T.serial(NI + 2):
+                    if i >= 1 and i < NI + 1:
+                        i_i = i - 1
+                        pingpang = i_i % 2
+                        T.wait_cross_flag(0, "MTE2")
+                        # T.barrier_all()
+                        T.copy(workspace_1[cid + (workspace_block_num * pingpang), 0:BI, 0:D], kv_l1)
+                        # T.barrier_all()
+                        T.set_flag("MTE2", "M", 1)
+                        T.wait_flag("MTE2", "M", 1)
 
-                    T.gemm_v0(q_l1, kv_l1, acc_s_l0c, transpose_B=True, init=True)
-                    T.barrier_all()
+                        T.gemm_v0(q_l1, kv_l1, acc_s_l0c, transpose_B=True, init=True)
+                        # T.barrier_all()
+                        T.set_flag("M", "FIX", 2)
+                        T.wait_flag("M", "FIX", 2)
 
-                    T.copy(acc_s_l0c, workspace_2[cid, 0:heads_per_group, 0:BI])
-                    T.barrier_all()
-                    T.set_cross_flag("FIX", 1)
+                        T.copy(acc_s_l0c, workspace_2[cid + (workspace_block_num * pingpang), 0:heads_per_group, 0:BI])
+                        # T.barrier_all()
+                        T.set_cross_flag("FIX", 1)
 
-                    T.wait_cross_flag(2)
-                    T.barrier_all()
+                    if i >= 2 and i < NI + 2:
+                        i_i = i - 2
+                        pingpang = i % 2
+                        T.wait_cross_flag(2, "MTE2")
+                        # T.barrier_all()
 
-                    T.copy(workspace_3[cid, 0:H_per_block, 0:BI], acc_s_l1)
-                    T.barrier_all()
+                        T.copy(workspace_3[cid + (workspace_block_num * pingpang), 0:H_per_block, 0:BI], acc_s_l1)
+                        # T.barrier_all()
+                        T.set_flag("MTE2", "M", 3)
+                        T.wait_flag("MTE2", "M", 3)
 
-                    T.gemm_v0(acc_s_l1, kv_l1, acc_o_l0c, init=True)
-                    T.barrier_all()
+                        T.gemm_v0(acc_s_l1, kv_l1, acc_o_l0c, init=True)
+                        # T.barrier_all()
+                        T.set_flag("M", "FIX", 4)
+                        T.wait_flag("M", "FIX", 4)
 
-                    T.copy(acc_o_l0c, workspace_4[cid, 0:H_per_block, 0:D])
-                    T.barrier_all()
+                        T.copy(acc_o_l0c, workspace_4[cid + (workspace_block_num * pingpang), 0:H_per_block, 0:D])
+                        # T.barrier_all()
 
-                    T.set_cross_flag("FIX", 3)
-                    T.wait_cross_flag(4)
-                T.wait_cross_flag(8)
+                        T.set_cross_flag("FIX", 3)
+                    # T.wait_cross_flag(4)
+                # T.wait_cross_flag(8)
 
             with T.Scope("V"):
 
                 T.tile.fill(acc_o, 0.0)
                 T.tile.fill(sumexp, 0.0)
                 T.tile.fill(m_i, -2.0**30)
-                T.barrier_all()
+                # T.barrier_all()
 
-                for i_i in range(NI):
-                    T.copy(Indices[b_i, s_i, g_i, i_i * BI:i_i * BI + BI], indices_ub_)
-                    T.barrier_all()
+                for i in range(NI + 2):
+                    if i >= 0 and i < NI:
+                        i_i = i
+                        pingpang = i_i % 2
+                        T.copy(Indices[b_i, s_i, g_i, i_i * BI:i_i * BI + BI], indices_ub_)
+                        # T.barrier_all()
+                        T.pipe_barrier("MTE2")
 
-                    for bi_i in range(BI // 2):
-                        T.copy(KV[b_i, indices_ub_[bi_i + vid * BI // 2], g_i, :D], kv_ub)
-                        T.barrier_all()
-                        T.copy(kv_ub, workspace_1[cid, bi_i + vid * BI // 2, :])
-                        T.barrier_all()
+                        for bi_i in range(BI // 2):
+                            T.copy(KV[b_i, indices_ub_[bi_i + vid * BI // 2], g_i, :D], kv_ub)
+                            # T.barrier_all()
+                            T.set_flag("MTE2", "MTE3", 2)
+                            T.wait_flag("MTE2", "MTE3", 2)
+                            T.copy(kv_ub, workspace_1[cid + (workspace_block_num * pingpang), bi_i + vid * BI // 2, :])
+                            # T.barrier_all()
 
-                    T.set_cross_flag("MTE3", 0)
+                        T.set_cross_flag("MTE3", 0)
 
-                    T.tile.fill(acc_s_ub, 0.0)
-                    T.barrier_all()
+                    if i >= 1 and i < NI + 1:
+                        i_i = i - 1
+                        pingpang = i_i % 2
+                        T.tile.fill(acc_s_ub, 0.0)
+                        # T.barrier_all()
 
-                    T.copy(m_i, m_i_prev)
-                    T.barrier_all()
+                        T.copy(m_i, m_i_prev)
+                        # T.barrier_all()
 
-                    T.wait_cross_flag(1)
-                    T.copy(
-                        workspace_2[cid, vid * v_block:vid * v_block + v_block, :],
-                        acc_s_ub_)
-                    T.barrier_all()
+                        T.wait_cross_flag(1, "MTE2")
+                        T.copy(
+                            workspace_2[cid + (workspace_block_num * pingpang), vid * v_block:vid * v_block + v_block, :],
+                            acc_s_ub_)
+                        # T.barrier_all()
+                        T.set_flag("MTE2", "V", 5)
+                        T.wait_flag("MTE2", "V", 5)
 
-                    T.tile.add(acc_s_ub, acc_s_ub, acc_s_ub_)
-                    T.barrier_all()
+                        T.tile.add(acc_s_ub, acc_s_ub, acc_s_ub_)
 
-                    T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
-                    T.barrier_all()
+                        T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
 
-                    T.reduce_max(acc_s_ub, m_i, tmp_ub, dim=-1)
-                    T.barrier_all()
+                        T.reduce_max(acc_s_ub, m_i, tmp_ub, dim=-1)
 
-                    T.tile.max(m_i, m_i, m_i_prev)
-                    T.barrier_all()
+                        T.tile.max(m_i, m_i, m_i_prev)
 
-                    T.tile.sub(m_i_prev, m_i_prev, m_i)
-                    T.barrier_all()
+                        T.tile.sub(m_i_prev, m_i_prev, m_i)
 
-                    T.tile.exp(m_i_prev, m_i_prev)
-                    T.barrier_all()
+                        T.tile.exp(m_i_prev, m_i_prev)
 
-                    # T.call_extern("handle", "trowexpandsub", acc_s_ub.access_ptr("w"), acc_s_ub.access_ptr("r"), m_i.access_ptr("r"))
-                    for h_i in range(v_block):
-                        T.barrier_all()
-                        T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i, 0])  # -
-                        T.barrier_all()
+                        # T.call_extern("handle", "trowexpandsub", acc_s_ub.access_ptr("w"), acc_s_ub.access_ptr("r"), m_i.access_ptr("r"))
+                        T.set_flag("V", "S", 4)
+                        T.wait_flag("V", "S", 4)
+                        for h_i in range(v_block):
+                            T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i, 0])  # -
 
-                    T.tile.exp(acc_s_ub, acc_s_ub)
-                    T.barrier_all()
+                        T.tile.exp(acc_s_ub, acc_s_ub)
 
-                    T.reduce_sum(acc_s_ub, sumexp_i_ub, tmp_ub, dim=-1)
-                    T.barrier_all()
+                        T.reduce_sum(acc_s_ub, sumexp_i_ub, tmp_ub, dim=-1)
 
-                    T.tile.mul(sumexp, sumexp, m_i_prev)  # check
-                    T.barrier_all()
+                        T.tile.mul(sumexp, sumexp, m_i_prev)  # check
 
-                    T.tile.add(sumexp, sumexp, sumexp_i_ub)
-                    T.barrier_all()
+                        T.tile.add(sumexp, sumexp, sumexp_i_ub)
 
-                    # T.call_extern("handle", "trowexpandmul", acc_o.access_ptr("w"), acc_o.access_ptr("r"), m_i_prev.access_ptr("r"))
-                    for h_i in range(v_block):
-                        T.barrier_all()
-                        T.tile.mul(acc_o[h_i, :], acc_o[h_i, :], m_i_prev[h_i, 0])
-                        T.barrier_all()
+                        # T.call_extern("handle", "trowexpandmul", acc_o.access_ptr("w"), acc_o.access_ptr("r"), m_i_prev.access_ptr("r"))
+                        T.set_flag("V", "S", 0)
+                        T.wait_flag("V", "S", 0)
+                        for h_i in range(v_block):
+                            T.tile.mul(acc_o[h_i, :], acc_o[h_i, :], m_i_prev[h_i, 0])
 
-                    T.copy(acc_s_ub, acc_s_half)
-                    T.barrier_all()
+                        T.copy(acc_s_ub, acc_s_half)
+                        # T.barrier_all()
+                        T.set_flag("V", "MTE3", 6)
+                        T.wait_flag("V", "MTE3", 6)
 
-                    T.copy(
-                        acc_s_half, workspace_3[cid,
-                                                vid * v_block:vid * v_block + v_block, :])
-                    T.barrier_all()
+                        T.copy(
+                            acc_s_half, workspace_3[cid + (workspace_block_num * pingpang),
+                                                    vid * v_block:vid * v_block + v_block, :])
+                        # T.barrier_all()
 
-                    T.set_cross_flag("MTE3", 2)
+                        T.set_cross_flag("MTE3", 2)
 
-                    T.wait_cross_flag(3)
-                    T.barrier_all()
+                    if i >= 2 and i < NI + 2:
+                        i_i = i - 2
+                        pingpang = i_i % 2
+                        T.wait_cross_flag(3, "MTE2")
+                        # T.barrier_all()
 
-                    T.copy(
-                        workspace_4[cid, vid * v_block:vid * v_block + v_block, :],
-                        acc_o_ub)
-                    T.barrier_all()
+                        T.copy(
+                            workspace_4[cid + (workspace_block_num * pingpang), vid * v_block:vid * v_block + v_block, :],
+                            acc_o_ub)
+                        # T.barrier_all()
+                        T.set_flag("MTE2", "V", 7)
+                        T.wait_flag("MTE2", "V", 7)
 
-                    T.tile.add(acc_o, acc_o, acc_o_ub)
-                    T.barrier_all()
+                        T.tile.add(acc_o, acc_o, acc_o_ub)
+                    # T.barrier_all()
 
-                    T.set_cross_flag("V", 4)
-                    T.barrier_all()
+                    # T.set_cross_flag("V", 4)
+                    # T.barrier_all()
 
                 # T.call_extern("handle", "trowexpanddiv", acc_o.access_ptr("w"), acc_o.access_ptr("r"), sumexp.access_ptr("r"))
                 for h_i in range(v_block):
-                    T.barrier_all()
+                    # T.barrier_all()
                     T.tile.div(acc_o[h_i, :], acc_o[h_i, :], sumexp[h_i, 0])
-                    T.barrier_all()
+                    # T.barrier_all()
 
                 T.copy(acc_o, acc_o_half)
-                T.barrier_all()
+                # T.barrier_all()
+                T.set_flag("V", "MTE3", 7)
+                T.wait_flag("V", "MTE3", 7)
                 T.copy(acc_o_half, Output[b_i, s_i, H0 + vid * v_block:H1 + vid * v_block, :])
 
-                T.barrier_all()
+                # T.barrier_all()
 
-                T.set_cross_flag("MTE3", 8)
+                # T.set_cross_flag("MTE3", 8)
 
     return main
 

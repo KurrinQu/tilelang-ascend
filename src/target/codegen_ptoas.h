@@ -61,6 +61,7 @@ public:
   void VisitStmt_(const SeqStmtNode *op) final;
   void VisitStmt_(const EvaluateNode *op) final;
   void VisitStmt_(const ForNode *op) final;
+  void VisitStmt_(const IfThenElseNode *op) final;
 
   mlir::Value VisitExpr_(const BufferLoadNode *op) final;
   mlir::Value VisitExpr_(const CallNode *op) final;

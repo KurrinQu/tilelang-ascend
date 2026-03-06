@@ -276,7 +276,6 @@ static void EmitScalarBinaryOp(CodeGenPTOAS *self, mlir::OpBuilder &builder, mli
     auto dtype = self->resolveArithType(call->args[2].as<CallNode>()->args[0]->dtype);
     auto stile = self->GetAsTile(call->args[2]);
     auto sidx = CastVal(builder, loc, self->VisitExpr(call->args[3]), builder.getIndexType(), false);
-    builder.create<mlir::pto::BarrierOp>(loc, mlir::pto::PipeAttr::get(&self->context, mlir::pto::PIPE::PIPE_ALL));
     rhs = builder.create<mlir::pto::TGetValOp>(loc, dtype, stile, sidx).getResult();
   } else {
     rhs = self->VisitExpr(call->args[2]);
@@ -559,6 +558,96 @@ void CodeGenPTOAS::VisitStmt_(const ForNode *op) {
   }
 }
 
+// Ensure a runtime condition value is converted to an i1 boolean MLIR value.
+// - If already i1, return as-is.
+// - If integer/index, compare != 0.
+// - If float, compare != 0.0 (ONE).
+static mlir::Value EnsureI1(mlir::OpBuilder &builder, mlir::Location loc, mlir::Value v) {
+  if (!v) return mlir::Value();
+  mlir::Type t = v.getType();
+  // already boolean
+  if (t.isInteger(1)) return v;
+
+  // index -> compare with 0
+  if (t.isIndex()) {
+    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, v, zero).getResult();
+  }
+
+  // integer types -> compare with zero
+  if (auto it = mlir::dyn_cast<mlir::IntegerType>(t)) {
+    auto zeroAttr = builder.getIntegerAttr(it, 0);
+    auto zero = builder.create<mlir::arith::ConstantOp>(loc, it, zeroAttr).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, v, zero).getResult();
+  }
+
+  // float types -> compare with 0.0 (ONE predicate)
+  if (auto ft = mlir::dyn_cast<mlir::FloatType>(t)) {
+    auto zeroF = mlir::FloatAttr::get(ft, 0.0);
+    auto zero = builder.create<mlir::arith::ConstantOp>(loc, ft, zeroF).getResult();
+    return builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::ONE, v, zero).getResult();
+  }
+
+  // fallback: attempt to cast to index then compare
+  if (auto casted = builder.createOrFold<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), v)) {
+    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0).getResult();
+    return builder.create<mlir::arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ne, casted, zero).getResult();
+  }
+
+  return v;
+}
+
+// Lower IfThenElse (tir::IfThenElseNode) to scf.if
+void CodeGenPTOAS::VisitStmt_(const IfThenElseNode *op) {
+  mlir::Location loc = builder.getUnknownLoc();
+
+  // Evaluate condition and canonicalize to i1
+  mlir::Value cond = VisitExpr(op->condition);
+  cond = EnsureI1(builder, loc, cond);
+  if (!cond) {
+    LOG(FATAL) << "Failed to generate condition for IfThenElse.";
+  }
+
+  bool hasElse = op->else_case.defined();
+
+  // Create scf.if with/without else region (no results)
+  auto ifOp = builder.create<mlir::scf::IfOp>(loc, /*resultTypes=*/llvm::ArrayRef<mlir::Type>{}, cond, hasElse);
+
+  // Then region
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    // scf.if may already create an empty block for the then-region.
+    // Only emplace a block when the region is empty; otherwise use the existing front().
+    auto &thenRegion = ifOp.getThenRegion();
+    if (thenRegion.empty()) {
+      thenRegion.emplaceBlock();
+    }
+    auto &thenBlock = thenRegion.front();
+    builder.setInsertionPointToStart(&thenBlock);
+    // Emit then body
+    VisitStmt(op->then_case);
+    // ensure terminator
+    if (thenBlock.empty() || !thenBlock.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
+  }
+
+  // Else region (if present)
+  if (hasElse) {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto &elseRegion = ifOp.getElseRegion();
+    if (elseRegion.empty()) {
+      elseRegion.emplaceBlock();
+    }
+    auto &elseBlock = elseRegion.front();
+    builder.setInsertionPointToStart(&elseBlock);
+    VisitStmt(op->else_case.value());
+    if (elseBlock.empty() || !elseBlock.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      builder.create<mlir::scf::YieldOp>(loc);
+    }
+  }
+}
+
 mlir::Value CodeGenPTOAS::VisitExpr_(const BufferLoadNode *op) {
   mlir::Location loc = builder.getUnknownLoc();
   std::string scope = op->buffer.scope();
@@ -716,7 +805,7 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
   if (op->op.same_as(tl::ascend_wait_flag())) {
     auto src_ = Downcast<StringImm>(op->args[0])->value;
     auto dst_ = Downcast<StringImm>(op->args[1])->value;
-    auto eid_ = Downcast<IntImm>(op->args[1])->value;
+    auto eid_ = Downcast<IntImm>(op->args[2])->value;
     auto src = mlir::pto::PipeAttr::get(&context, GetPipe(src_));
     auto dst = mlir::pto::PipeAttr::get(&context, GetPipe(dst_));
     auto eid = mlir::pto::EventAttr::get(&context, (mlir::pto::EVENT)eid_);
@@ -737,7 +826,7 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
         LOG(FATAL) << "Unknown source scope for wait_cross_flag: " << this->source_scope;
       }
     } else {
-      LOG(FATAL) << "Specifying pipe name in wait_cross_flag is not supported yet.";
+      pipe = GetPipe(pstr);
     }
     builder.create<mlir::pto::SyncWaitOp>(loc, mlir::pto::PipeAttr::get(&context, pipe), mlir::IntegerAttr::get(builder.getIntegerType(32), flag));
     if (this->source_scope == "CUBE") {
@@ -948,7 +1037,13 @@ mlir::Value CodeGenPTOAS::VisitExpr_(const CallNode *op) {
         LOG(FATAL) << "Unsupported reduce operation: " << opname;
       }
     } else {
-      LOG(FATAL) << "Unsupported reduce dimension: " << rdim;
+      if (opname.find("reduce_sum") != std::string::npos) {
+        builder.create<mlir::pto::TColSumOp>(loc, src, tmp, res);
+      } else if (opname.find("reduce_max") != std::string::npos) {
+        builder.create<mlir::pto::TColMaxOp>(loc, src, res);
+      } else {
+        LOG(FATAL) << "Unsupported reduce operation: " << opname;
+      }
     }
     if (origin != res) {
       builder.create<mlir::pto::TReshapeOp>(loc, res, origin);
@@ -1360,6 +1455,43 @@ static std::vector<mlir::Value> makeSubviewSizes(mlir::OpBuilder &builder, mlir:
   return sizes;
 }
 
+// Unified template handler for expand operations
+// Template parameter: ExpandOpT - MLIR operation type (e.g., TRowExpandSubOp, TColExpandMulOp)
+// Arguments: self - CodeGenPTOAS instance
+//            loc - MLIR Location
+//            op - Current CallNode, used to access args
+template<typename ExpandOpT>
+void HandleExpandBinOpImpl(CodeGenPTOAS* self, mlir::Location loc, const tvm::tir::CallNode* op) {
+  auto res = self->GetAsTile(op->args[1]);
+  auto lhs = self->GetAsTile(op->args[2]);
+  auto xpd = self->GetAsTile(op->args[3]);
+
+  auto origin = xpd;
+  if (self->symbolTable[self->GetBufferVar(op->args[3])].need_reshape_for_reduce) {
+    auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
+    auto rmshape = xpdty.getShape();
+    std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
+    auto cmdtype = xpdty.getElementType();
+    auto cmspace = xpdty.getMemorySpace();
+    auto cmbl = BLayoutAttr::get(&self->context, BLayout::ColMajor);
+    auto cmsl = SLayoutAttr::get(&self->context, SLayout::NoneBox);
+    auto cmpd = PadValueAttr::get(&self->context, PadValue::Null);
+    auto cmfractal = mlir::IntegerAttr::get(self->builder.getIntegerType(32), 512);
+    auto cmcfg = mlir::pto::TileBufConfigAttr::get(&self->context, cmbl, cmsl, cmfractal, cmpd);
+    auto cmtype = mlir::pto::TileBufType::get(&self->context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
+    auto cmtile = self->builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
+    self->builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
+    xpd = cmtile;
+  }
+
+  // Create MLIR op using template parameter
+  self->builder.create<ExpandOpT>(loc, lhs, xpd, res);
+
+  if (origin != xpd) {
+    self->builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
+  }
+}
+
 mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
   std::string op_name = Downcast<StringImm>(op->args[0])->value;
   auto loc = builder.getUnknownLoc();
@@ -1434,86 +1566,23 @@ mlir::Value CodeGenPTOAS::CallExternCodegen(const CallNode *op) {
       LOG(FATAL) << "Unsupported copy operation: " << op_name;
     }
   } else if (op_name == "trowexpandsub") {
-    auto res = GetAsTile(op->args[1]);
-    auto lhs = GetAsTile(op->args[2]);
-    auto xpd = GetAsTile(op->args[3]);
-
-    auto origin = xpd;
-    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
-      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
-      auto rmshape = xpdty.getShape();
-      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
-      auto cmdtype = xpdty.getElementType();
-      auto cmspace = xpdty.getMemorySpace();
-      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
-      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
-      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
-      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
-      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
-      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
-      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
-      xpd = cmtile;
-    }
-    builder.create<mlir::pto::TRowExpandSubOp>(loc, lhs, xpd, res);
-    if (origin != xpd) {
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
-    }
+    HandleExpandBinOpImpl<mlir::pto::TRowExpandSubOp>(this, loc, op);
     return mlir::Value();
   } else if (op_name == "trowexpandmul") {
-    auto res = GetAsTile(op->args[1]);
-    auto lhs = GetAsTile(op->args[2]);
-    auto xpd = GetAsTile(op->args[3]);
-
-    auto origin = xpd;
-    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
-      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
-      auto rmshape = xpdty.getShape();
-      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
-      auto cmdtype = xpdty.getElementType();
-      auto cmspace = xpdty.getMemorySpace();
-      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
-      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
-      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
-      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
-      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
-      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
-      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
-      xpd = cmtile;
-    }
-    builder.create<mlir::pto::TRowExpandMulOp>(loc, lhs, xpd, res);
-    if (origin != xpd) {
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
-    }
+    HandleExpandBinOpImpl<mlir::pto::TRowExpandMulOp>(this, loc, op);
     return mlir::Value();
   } else if (op_name == "trowexpanddiv") {
-    auto res = GetAsTile(op->args[1]);
-    auto lhs = GetAsTile(op->args[2]);
-    auto xpd = GetAsTile(op->args[3]);
-
-    auto origin = xpd;
-    if (symbolTable[GetBufferVar(op->args[3])].need_reshape_for_reduce) {
-      auto xpdty = llvm::cast<mlir::pto::TileBufType>(xpd.getType());
-      auto rmshape = xpdty.getShape();
-      std::vector<int64_t> cmshape = {rmshape[1], rmshape[0]};
-      auto cmdtype = xpdty.getElementType();
-      auto cmspace = xpdty.getMemorySpace();
-      auto cmbl = BLayoutAttr::get(&context, BLayout::ColMajor);
-      auto cmsl = SLayoutAttr::get(&context, SLayout::NoneBox);
-      auto cmpd = PadValueAttr::get(&context, PadValue::Null);
-      auto cmfractal = mlir::IntegerAttr::get(builder.getIntegerType(32), 512);
-      auto cmcfg = mlir::pto::TileBufConfigAttr::get(&context, cmbl, cmsl, cmfractal, cmpd);
-      auto cmtype = mlir::pto::TileBufType::get(&context, cmshape, cmdtype, cmspace, cmshape, cmcfg);
-      auto cmtile = builder.create<mlir::pto::AllocTileOp>(loc, cmtype, mlir::Value(), mlir::Value()).getResult();
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, cmtile);
-      xpd = cmtile;
-    }
-    builder.create<mlir::pto::TRowExpandDivOp>(loc, lhs, xpd, res);
-    if (origin != xpd) {
-      builder.create<mlir::pto::TReshapeOp>(loc, xpd, origin);
-    }
+    HandleExpandBinOpImpl<mlir::pto::TRowExpandDivOp>(this, loc, op);
     return mlir::Value();
+  // } else if (op_name == "tcolexpandsub") {
+  //   HandleExpandBinOpImpl<mlir::pto::TColExpandSubOp>(this, loc, op);
+  //   return mlir::Value();
+  // } else if (op_name == "tcolexpandmul") {
+  //   HandleExpandBinOpImpl<mlir::pto::TColExpandMulOp>(this, loc, op);
+  //   return mlir::Value();
+  // } else if (op_name == "tcolexpanddiv") {
+  //   HandleExpandBinOpImpl<mlir::pto::TColExpandDivOp>(this, loc, op);
+  //   return mlir::Value();
   } else {
     LOG(FATAL) << "Unsupported call operation: " << op_name;
   }
