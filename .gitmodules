@@ -16,3 +16,6 @@
 [submodule "3rdparty/shmem"]
 	path = 3rdparty/shmem
 	url = https://gitcode.com/cann/shmem
+[submodule "3rdparty/PTOAS"]
+	path = 3rdparty/PTOAS
+	url = https://github.com/zhangstevenunity/PTOAS.git
