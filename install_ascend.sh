@@ -16,9 +16,9 @@ while [[ $# -gt 0 ]]; do
             USE_SHMEM=true
             shift
             ;;
-        --ptoas-root)
-            PTOAS_ROOT="$2"
-            shift 2
+        --enable-ptoas)
+            ENABLE_PTOAS=true
+            shift
             ;;
         --llvm-root)
             LLVM_ROOT="$2"
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--enable-llvm] [--enable-shmem] [--ptoas-root <path>] [--llvm-root <path>]"
+            echo "Usage: $0 [--enable-llvm] [--enable-shmem] [--enable-ptoas] [--llvm-root <path>]"
             exit 1
             ;;
     esac
@@ -45,7 +45,7 @@ fi
 echo "Starting installation script..."
 echo "LLVM enabled: $USE_LLVM"
 echo "SHMEM enabled: $USE_SHMEM"
-echo "PTOAS root path: ${PTOAS_ROOT:-'not specified'}"
+echo "PTOAS enabled: $ENABLE_PTOAS"
 
 # Step 1: Install Python requirements
 echo "Installing Python requirements from requirements.txt..."
@@ -123,10 +123,42 @@ if $USE_LLVM; then
     echo "LLVM config path determined as: $LLVM_CONFIG_PATH"
 fi
 
-# Step 9: Clone and build TVM
-echo "Cloning TVM repository and initializing submodules..."
-# clone and build tvm
+# Step 9: Clone and build PTOAS
+echo "Initializing submodules..."
 git submodule update --init --recursive
+if [[ "$ENABLE_PTOAS" == "true" ]]; then
+    pushd 3rdparty/PTOAS
+    if [ -d build ]; then
+        rm -rf build
+    fi
+
+    echo "Building PTOAS..."
+    mkdir build
+    cmake -G Ninja -S . -B build \
+        -DLLVM_DIR=$(realpath $LLVM_ROOT/lib/cmake/llvm) \
+        -DMLIR_DIR=$(realpath $LLVM_ROOT/lib/cmake/mlir) \
+        -DPTO_ENABLE_PYTHON_BINDING=OFF \
+        -DCMAKE_INSTALL_PREFIX="$(realpath install)"
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: CMake PTOAS error!"
+        exit 1
+    fi
+
+    ninja -j$(($(nproc) * 50 / 100 )) install -C build
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Build PTOAS error!"
+        exit 1
+    fi
+
+    popd
+    PTOAS_ROOT=$(realpath 3rdparty/PTOAS)
+    echo "Use PTOAS_ROOT: $PTOAS_ROOT"
+fi
+
+# Step 10: build TVM
+echo "Initializing TVM..."
 
 if [ -d build ]; then
     rm -rf build
