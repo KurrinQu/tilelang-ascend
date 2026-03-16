@@ -180,7 +180,7 @@ if [[ -n "$LLVM_ROOT" ]]; then
 fi
 
 if [[ -n "$PTOAS_ROOT" ]]; then
-    PTOAS_DIR=${PTOAS_ROOT}/install/lib/cmake/PTOAS
+    PTOAS_DIR=$(find "$PTOAS_ROOT"/install -name "PTOASConfig.cmake" -printf '%h' -quit)
     echo "set(PTOAS_DIR ${PTOAS_DIR})" >> config.cmake
     echo "Using PTOAS root at: $PTOAS_ROOT"
 fi

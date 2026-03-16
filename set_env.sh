@@ -3,6 +3,7 @@
 TL_ROOT=$(readlink -f "${BASH_SOURCE[0]}")
 export TL_ROOT=$(dirname "$TL_ROOT")
 export PYTHONPATH=${TL_ROOT}:$PYTHONPATH
+export PTOAS=${TL_ROOT}/3rdparty/PTOAS/build/tools/ptoas/ptoas
 
 # disable the import of tvm when using torch_npu
 export ACL_OP_INIT_MODE=1

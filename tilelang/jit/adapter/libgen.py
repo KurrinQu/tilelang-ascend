@@ -119,7 +119,7 @@ class LibraryGenerator(object):
             dst0 = tempfile.NamedTemporaryFile(mode="w+", suffix=".cpp", delete=False)
             arch = "--pto-arch=a5" if self.platform == "A5" else ""
             cmd0 = [
-                "ptoas",
+                f"{os.environ['PTOAS']}",
                 f"{arch}",
                 f"{src0.name}"
             ]
